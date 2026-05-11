@@ -8,6 +8,7 @@ pre-computed LibreLane run at ~/Code/Apitronix/hazard-test (see the
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 
 import torch
@@ -20,8 +21,92 @@ FINAL_DEF = Path(
     "/Users/roberttaylor/Code/Apitronix/hazard-test/hazard3/librelane/runs/"
     "RUN_2026-05-08_22-32-24/final/def/synth_top_level_3.def"
 )
-LAYER_ORDER = ["Metal1", "Metal2", "Metal3", "Metal4", "Metal5"]
-PITCH_DBU = 200  # gf180mcuD: 0.20um wire pitch, 1 DBU = 1 nm
+
+
+@dataclass(frozen=True)
+class Pdk:
+    """Technology descriptor for a routing target.
+
+    Encodes structural rules (which layers are pin-access-only, the
+    layer stack, the pitch) separately from cost-tuning knobs
+    (preferred-direction off-axis multiplier, via cost). The PDK
+    rules are *constraints* enforced by build/mask steps; the cost
+    knobs are *heuristics* tuned on top. Mirrors how real DR tools
+    keep technology rules and cost weights distinct.
+    """
+
+    name: str
+    layer_order: tuple[str, ...]
+    preferred_direction: tuple[str, ...]  # "H" or "V" per layer
+    # 0-indexed entries from layer_order whose DRC forbids wire (only via
+    # anchors / pin landings allowed). Currently always M1 for gf180mcuD.
+    pin_access_only_layers: tuple[int, ...]
+    pitch_dbu: int
+
+
+GF180MCUD = Pdk(
+    name="gf180mcuD",
+    layer_order=("Metal1", "Metal2", "Metal3", "Metal4", "Metal5"),
+    preferred_direction=("H", "V", "H", "V", "H"),
+    pin_access_only_layers=(0,),
+    pitch_dbu=200,
+)
+
+# Module-level aliases kept for back-compat with existing call sites.
+LAYER_ORDER = list(GF180MCUD.layer_order)
+PITCH_DBU = GF180MCUD.pitch_dbu
+
+
+def apply_pin_access_rules(
+    w: torch.Tensor,
+    pdk: Pdk,
+    pin_cells: list[tuple[int, int, int]],
+    landing_pad_radius: int = 1,
+) -> None:
+    """In-place: enforce pin-access-only layers from the PDK.
+
+    For each layer in pdk.pin_access_only_layers, marks every cell as
+    inf except a `(2*landing_pad_radius+1)^2` block around each
+    matching pin coord. This is the structural encoding of the DRC
+    rule "no wire on this layer" -- the router cannot route through
+    these layers except where pins physically land. Costs become
+    heuristic weights applied on top; pin-access-only-ness is
+    structural and not a tunable cost knob.
+
+    The landing pad absorbs minor center-of-rect rounding when the
+    real via anchor sits one cell off the rect center. Set radius=0
+    for a strict point-only constraint.
+    """
+    H, W = w.shape[-2:]
+    for lyr_idx in pdk.pin_access_only_layers:
+        w[lyr_idx] = float("inf")
+        for pl, pr, pc in pin_cells:
+            if pl != lyr_idx:
+                continue
+            rlo = max(0, pr - landing_pad_radius)
+            rhi = min(H, pr + landing_pad_radius + 1)
+            clo = max(0, pc - landing_pad_radius)
+            chi = min(W, pc + landing_pad_radius + 1)
+            w[lyr_idx, rlo:rhi, clo:chi] = 1.0
+
+
+def preferred_direction_multipliers(
+    pdk: Pdk, off_mult: float, m1_penalty: float = 1.0
+) -> tuple[list[float], list[float]]:
+    """Build (h_mult, v_mult) per-layer cost multipliers from a PDK.
+
+    Off-preferred axis on each layer gets `off_mult`; preferred axis
+    stays at 1.0. `m1_penalty` (kept as an experiment knob only)
+    overrides M1 to penalise both axes -- redundant when pin-access
+    rules are applied (which is the default) but useful for ablation
+    studies.
+    """
+    h_mult = [1.0 if d == "H" else off_mult for d in pdk.preferred_direction]
+    v_mult = [1.0 if d == "V" else off_mult for d in pdk.preferred_direction]
+    if m1_penalty != 1.0:
+        h_mult[0] = m1_penalty
+        v_mult[0] = m1_penalty
+    return h_mult, v_mult
 
 
 def parse_guides(path: Path) -> dict[str, list[tuple[int, int, int, int, str]]]:
