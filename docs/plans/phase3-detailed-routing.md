@@ -96,17 +96,20 @@ so closing the M4/M5 gap needs a different lever.
    `scripts/spike_route_many_nets.py` and `scripts/render_routes.py`. The
    "pin-only as PDK rule" refactor (next deliverable) supersedes them.
 
-3. **Encode M1-as-pin-only as a PDK rule.** *Next.* Lift the M1-mask
-   logic out of script-level knobs and into `build_grid()`, parameterised
-   by a PDK descriptor (preferred-direction table + pin-access-only
-   layers). Costs become heuristic weights; pin-only-ness becomes a
-   structural constraint, mirroring how real DR tools separate technology
-   rules from cost weights. Small refactor (~30 lines + tests).
+3. **Encode M1-as-pin-only as a PDK rule.** Shipped 2026-05-11, commit
+   `907f632`. New `Pdk` dataclass + `GF180MCUD` instance in
+   `scripts/_hazard3_io.py` holds technology constraints (layer order,
+   preferred direction, pin-access-only layer indices, pitch).
+   `apply_pin_access_rules(w, pdk, pin_cells)` is the structural
+   encoding of the no-wire-on-M1 DRC rule. Both scripts apply rules by
+   default; `--no-pdk-rules` is a legacy bypass for ablation studies.
+   Numbers match the prior `m1_pin_only=True` knob; behaviour is now
+   the default instead of opt-in.
 
-4. **Multi-pin nets.** ~11K of 24K Hazard3 nets have 3+ pins; spike was
-   2-pin only. Sequential point-to-point with re-rooting, or a
-   Steiner-tree-flavoured heuristic. Biggest unmodelled gap; not subsumed
-   by tile decomposition.
+4. **Multi-pin nets.** *Next.* ~11K of 24K Hazard3 nets have 3+ pins;
+   spike was 2-pin only. Sequential point-to-point with re-rooting, or
+   a Steiner-tree-flavoured heuristic. Biggest unmodelled gap; not
+   subsumed by tile decomposition.
 
 5. **Per-via-pair `via_cost`.** Replace the scalar with a length-`(L-1)`
    array. Targets the M4/M5 gap that `m1_penalty` couldn't move. Defer
@@ -122,8 +125,9 @@ preference instead is an interim hack we'd throw away. Skip it.
 **Exit criteria for WS3.2:**
 
 - [x] Preferred-direction landed; ADR 0010 captures the decision.
-- [x] M1-as-pin-access encoding (knob form). PDK-rule encoding is next.
-- [ ] M1-as-pin-only encoded as a PDK rule in `build_grid()`.
+- [x] M1-as-pin-access encoding (knob form, commit `8ecc95c`).
+- [x] M1-as-pin-only encoded as a PDK rule (commit `907f632`). Defaults
+      on; bypass via `--no-pdk-rules` for ablation.
 - [ ] Multi-pin nets supported by `route_nets_3d`; at least 80% of
       Hazard3's multi-pin nets route end-to-end.
 - [ ] Per-via-pair `via_cost` plumbed through; TR comparison re-run with
