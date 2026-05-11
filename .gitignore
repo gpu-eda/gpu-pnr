@@ -13,3 +13,6 @@ wheels/
 .claude/settings.local.json
 .claude/tsc-cache/
 .tldr/
+
+# Render output (regenerate via scripts/render_routes.py)
+viz_output/
