@@ -1,6 +1,8 @@
 # ADR 0010 — Per-axis cost tensors (w, w_v) for preferred-direction routing
 
-**Status:** Accepted (2026-05-11).
+**Status:** Accepted (2026-05-11). Amended 2026-05-11 — see Consequences §6
+("modeling-level correction from full-chip visualization") and the
+m1_penalty/pin-only follow-up in commit `8ecc95c`.
 
 ## Context
 
@@ -100,6 +102,30 @@ kernel architecture.
   (Phase 3 plan deliverable 3) or multi-pin Steiner topology
   (deliverable 2), not to preferred direction. See
   [`../results.md`](../results.md) for the comparison table.
+
+- **Modeling-level correction from full-chip visualization (amendment,
+  2026-05-11).** The N=500 "PD ties with `m1_cost=10`" observation was
+  *not* a sign that the two are equivalent. The full-chip 12,770-net
+  visualization showed that PD alone routes ~100K cells of illegal
+  M1-H wire — because PD makes M1-V expensive on the off-preferred
+  axis but leaves M1-H cheap on the preferred axis. The
+  spike's `m1_cost` knob penalised *both* axes; PD only penalises
+  *one*. At small N the difference is invisible (per-net horizontal
+  runs are short), but at chip scale it accumulates.
+
+  Fix: introduce a separate `m1_penalty` knob (both-axes M1
+  multiplier) and a stricter `m1_pin_only` mode (mask all M1 cells
+  except pin coords). Commit `8ecc95c`. With `m1_penalty=10` the
+  full-chip M1 wire drops 91% and our M3 use rises from 0.41× to
+  0.73× of TR's. M4 and M5 are untouched by this knob — those gaps
+  need per-via-pair costs or chip-scale routing.
+
+  The "PD = m1_cost generalization" framing at the kernel level
+  stands (axis-aware costs subsume both). At the modeling level for
+  M1 specifically, PD alone is insufficient; the both-axes penalty
+  (or pin-only mask) must be applied separately. The right long-term
+  encoding is to lift M1-as-pin-only into `build_grid` as a PDK rule,
+  not a tunable cost knob — Phase 3 plan WS3.2 deliverable 3.
 
 ## Walk-back options
 

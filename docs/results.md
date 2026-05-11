@@ -323,3 +323,123 @@ deliverables 2 and 3.
   comparison.
 - The remaining unmodelled constraints (per-via-pair, multi-pin) are
   now the only items left in WS3.2.
+
+# Phase 3.2 — visualization and M1-penalty / pin-only investigation
+
+After the preferred-direction landing, `scripts/render_routes.py`
+provides per-layer chip-scale overlays of our routes vs TritonRoute's
+geometry parsed from the post-DR DEF. Two modes: chip-scale binned
+overlay (the same smallest-N sample as `spike_route_many_nets.py`,
+one PNG per layer) and per-net per-layer detail view. The chip-scale
+images surfaced two findings that the aggregate spike numbers had
+hidden.
+
+## Finding 1: PD alone leaves long M1 wires at full chip scale
+
+The smallest-500 spike numbers tied with `m1_cost=10` (1.36×/0.80×).
+We took that as evidence that preferred direction and M1-cost
+penalty were equivalent at the topology level. The full 12,770-net
+chip view falsified that:
+
+| Layer | ours (binned) | TR (binned) | ours/TR | Notes |
+|-------|---------------|-------------|---------|---|
+| M1    | **100K wire** | 29K (anchors only) | 3.45× | PD model routes long M1-H wires |
+| M2    | 220K          | 292K        | 0.75×   | V-pref backbone |
+| M3    | 113K          | 273K        | **0.41×** | TR escapes to M3 far more |
+| M4    | 31K           | 60K         | 0.52×   | long-haul V |
+| M5    | 30K           | 32K         | 0.94×   | long-haul H, near parity |
+
+The PD model makes M1-V expensive (10× off-axis) but leaves **M1-H
+cheap** (preferred axis on a horizontal-pref layer). For long
+horizontal nets, the router routinely runs M1-H wire — which the
+gf180mcuD DRC forbids. At the small-N scale that was invisible
+because per-net horizontal runs were short; at full chip those
+M1-H runs accumulate to ~100K cells of illegal routing.
+
+This corrects ADR 0010's "PD = m1_cost generalization" framing. The
+two are equivalent at the kernel level (axis-aware costs) but
+diverge at the modeling level: `m1_cost` penalised both axes; PD
+only penalises off-preferred.
+
+## Finding 2: `m1_penalty=10` recovers the missing constraint
+
+Adding back the both-axes penalty (`m1_penalty`) on M1 specifically,
+on top of the PD model, drops M1 wire dramatically and pushes the
+displaced traffic onto M3:
+
+| Layer | PD only | + m1_penalty=10 | Δ | TR baseline | new ours/TR |
+|-------|---------|-----------------|---|-------------|-------------|
+| M1 (wire) | 100K | **9.1K** | **−91%** | 29K | 0.31× |
+| M2    | 220K | 167K | −24% | 292K | 0.57× |
+| M3    | 113K | **198K** | **+75%** | 273K | **0.73×** ↑ from 0.41× |
+| M4    | 31K  | 31K  | unchanged | 60K | 0.52× |
+| M5    | 30K  | 30K  | unchanged | 32K | 0.94× |
+
+M4 and M5 numbers are **literally identical** between the two runs
+(same binned pixel counts). Those nets' decisions are driven by
+long-haul distance, not the M1↔M3 cost balance; m1_penalty doesn't
+move them.
+
+## Finding 3: pin-only mode is equivalent on M3-in-guide nets
+
+A strict mode (`--m1-pin-only`) marks every M1 cell as `inf` except
+the source/sink pin coords and a 1-cell-radius landing pad. Forces
+via-stacking off M1 unconditionally — the closest approximation of
+gf180mcuD's no-M1-wire DRC rule.
+
+On 100 nets that have M3 in their guide:
+
+| Knob | M1 wire share | M3 cells |
+|---|---|---|
+| PD only | 41.4% | 9,823 |
+| `m1_penalty=10` | 1.2% | 16,732 |
+| `m1_pin_only`   | 1.8% | 16,632 |
+
+Pin-only is ~1.8% (3-cell landing pads × 2 pins = 6 cells per net),
+m1_penalty is ~1.2% (just the pin cell × 2). Effectively identical
+TR-style topology.
+
+On the smallest 100 nets (no M3 in their guide), all three modes
+produce the *same* numbers: M1=1.6%, M2=98.4%. The router was
+already using M1 only at pin endpoints because PD-on-M2-V was
+cheaper than long M1-H for those short routes. The M1-wire problem
+was specifically a **middle-cohort** problem (nets with M3 in guide
+but our PD model picking M1 over M3).
+
+## Finding 4: there's a structural cohort our model can't reach
+
+Of the 12,770 two-pin nets, ~6,000 have **no M3 in their guide** —
+GR allocated them to M1+M2 only, deciding the route is short enough
+not to need M3. TritonRoute breaks out of the guide for these (M1
+wire is DRC-illegal, so TR escapes to M2+ regardless of guide). Our
+spike builds per-net mini-grids with off-guide cells as `inf`, so
+the router *can't* escape — it's a hard constraint, not a soft
+preference.
+
+This is the residual gap on M3 (still ~27% vs TR) after the
+m1_penalty fix. Two ways to close it:
+
+1. **Soft guide**: make off-guide cells a finite penalty instead of
+   `inf`. Quick fix, but it's an interim hack.
+2. **Chip-scale grid (WS3.3, tile decomposition)**: drop per-net
+   mini-grids entirely. Once we route on a single global cost
+   tensor, the GR allocation becomes naturally advisory — any net
+   can escape into cells GR didn't assign to it. Subsumes the
+   soft-guide approach.
+
+The latter is on the Phase 3 plan as the next architectural slice
+after the WS3.2 deliverables. Choosing it over soft-guide avoids
+investing in an interim mechanism we'd throw away.
+
+## Implementation conclusion: M1-as-pin-only should be a PDK rule
+
+The M1-penalty knob exists in two forms now: `m1_penalty` (soft cost
+multiplier) and `m1_pin_only` (hard `inf` mask). Both are
+experiment-time tunables. The right encoding is to lift the rule
+into the cost-grid construction itself: `build_grid` should take a
+PDK descriptor naming which layers are pin-access-only, and emit
+the `inf` mask automatically. Costs would then be cost weights;
+pin-only-ness would be a structural constraint, mirroring how real
+DR tools split technology rules from heuristic weights. Deferred
+until the cost-grid construction is refactored more broadly
+(probably during WS3.3).
