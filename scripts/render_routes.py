@@ -47,7 +47,7 @@ from _hazard3_io import (
     preferred_direction_multipliers,
     rect_center_to_grid,
 )
-from gpu_pnr.router import route_nets_3d
+from gpu_pnr.router import route_multipin_nets_3d, route_nets_3d
 from gpu_pnr.sweep import axis_costs
 
 PDK = GF180MCUD
@@ -151,14 +151,21 @@ def _downsample_or_canvas(canvas: np.ndarray, scale: int) -> np.ndarray:
     return out
 
 
-def _sample_two_pin(n: int) -> list[tuple[str, list]]:
+def _sample_nets(n: int, min_pins: int, max_pins: int | None) -> list[tuple[str, list]]:
+    """Sample the N smallest nets whose Metal1 pin count is in
+    [min_pins, max_pins] inclusive (max_pins=None means no upper bound).
+    """
     all_nets = parse_guides(GUIDE)
-    two_pin = [
-        (name, rects) for name, rects in all_nets.items()
-        if sum(1 for r in rects if r[4] == "Metal1") == 2
-    ]
-    two_pin.sort(key=lambda nr: len(nr[1]))
-    return two_pin[:n]
+    candidates = []
+    for name, rects in all_nets.items():
+        pin_count = sum(1 for r in rects if r[4] == "Metal1")
+        if pin_count < min_pins:
+            continue
+        if max_pins is not None and pin_count > max_pins:
+            continue
+        candidates.append((name, rects))
+    candidates.sort(key=lambda nr: len(nr[1]))
+    return candidates[:n]
 
 
 def render_chip(
@@ -168,8 +175,14 @@ def render_chip(
     off_mult: float,
     m1_penalty: float,
     no_pdk_rules: bool,
+    multipin: bool,
 ) -> None:
-    """Chip-scale per-layer overlay over the N smallest two-pin nets."""
+    """Chip-scale per-layer overlay over the N smallest nets.
+
+    With `multipin=False` (default) the sample is restricted to 2-pin
+    nets routed via `route_nets_3d`. With `multipin=True`, the sample
+    is 3+-pin nets routed via `route_multipin_nets_3d`.
+    """
     xlo, ylo, xhi, yhi = parse_def_diearea(FINAL_DEF)
     H_chip = (yhi - ylo) // PITCH_DBU + 1
     W_chip = (xhi - xlo) // PITCH_DBU + 1
@@ -177,7 +190,12 @@ def render_chip(
     ours = np.zeros((L, H_chip, W_chip), dtype=bool)
     theirs = np.zeros((L, H_chip, W_chip), dtype=bool)
 
-    sample = _sample_two_pin(n)
+    if multipin:
+        sample = _sample_nets(n, min_pins=3, max_pins=None)
+        print(f"chip mode: MULTI-PIN ({n} smallest 3+-pin nets)")
+    else:
+        sample = _sample_nets(n, min_pins=2, max_pins=2)
+        print(f"chip mode: 2-pin ({n} smallest 2-pin nets)")
     geo = parse_def_net_geometry(FINAL_DEF)
     print(f"chip canvas: {H_chip}x{W_chip} cells, scale={scale} -> "
           f"{H_chip // scale}x{W_chip // scale} px")
@@ -205,25 +223,32 @@ def render_chip(
         try:
             w, origin = build_grid(rects)
             m1 = [r for r in rects if r[4] == "Metal1"]
-            src = rect_center_to_grid(m1[0], origin)
-            snk = rect_center_to_grid(m1[1], origin)
+            pins = [rect_center_to_grid(r, origin) for r in m1]
             if apply_rules:
-                apply_pin_access_rules(w, PDK, [src, snk])
+                apply_pin_access_rules(w, PDK, pins)
             if h_mult is not None and v_mult is not None:
                 w_h, w_v = axis_costs(w, h_mult, v_mult)
             else:
                 w_h, w_v = w, None
         except (ValueError, IndexError):
             continue
-        res = route_nets_3d(w_h, [(src, snk)], via_cost=5.0, w_v=w_v)
-        path = res[0].path
-        if path is None:
-            continue
+        if multipin:
+            mp_res = route_multipin_nets_3d(
+                w_h, [pins], via_cost=5.0, w_v=w_v
+            )[0]
+            if not mp_res.routed:
+                continue
+            our_cells: list[tuple[int, int, int]] = list(mp_res.cells)
+        else:
+            res = route_nets_3d(w_h, [(pins[0], pins[1])], via_cost=5.0, w_v=w_v)
+            if res[0].path is None:
+                continue
+            our_cells = res[0].path
         routed += 1
         # Map our (layer, row, col) cells back to chip cells.
         ox = origin[0] // PITCH_DBU
         oy = origin[1] // PITCH_DBU
-        for lyr, r, c in path:
+        for lyr, r, c in our_cells:
             chip_r = oy + r
             chip_c = ox + c
             if 0 <= chip_r < H_chip and 0 <= chip_c < W_chip:
@@ -381,12 +406,16 @@ def main() -> None:
                    help="disable the M1-as-pin-only PDK rule; the router "
                         "may then place wire on M1. Legacy mode for "
                         "comparison with the pre-PDK-rule cost model")
+    p.add_argument("--multipin", action="store_true",
+                   help="chip mode only: sample 3+-pin nets and route them "
+                        "via route_multipin_nets_3d (incremental tree "
+                        "growth) instead of 2-pin nets")
     args = p.parse_args()
 
     if args.mode == "chip":
         render_chip(
             args.n, args.scale, args.out, args.off_mult, args.m1_penalty,
-            args.no_pdk_rules,
+            args.no_pdk_rules, args.multipin,
         )
     else:
         if args.net is None:
