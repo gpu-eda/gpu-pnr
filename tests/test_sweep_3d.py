@@ -8,6 +8,7 @@ import torch
 
 from gpu_pnr.baseline import dijkstra_grid, dijkstra_grid_3d
 from gpu_pnr.sweep import (
+    axis_costs,
     backtrace_3d,
     sweep_sssp,
     sweep_sssp_3d,
@@ -183,3 +184,129 @@ def test_dijkstra_3d_collapses_to_2d_when_one_layer():
     d_2d = dijkstra_grid(w2d, (0, 0))
     d_3d = dijkstra_grid_3d(w2d.unsqueeze(0), (0, 0, 0), via_cost=99.0)
     _assert_distances_match(d_3d[0], d_2d)
+
+
+def test_anisotropic_w_v_none_equals_isotropic():
+    """sweep_sssp_3d(w_v=None) must equal sweep_sssp_3d(w_v=w) -- back-compat."""
+    torch.manual_seed(10)
+    L, H, W = 3, 12, 12
+    w = torch.rand(L, H, W) + 0.1
+    w[1, 5, 2:10] = math.inf
+    source = (0, 0, 0)
+    via_cost = 0.7
+    d_iso, _ = sweep_sssp_3d(w, source, via_cost=via_cost)
+    d_explicit, _ = sweep_sssp_3d(w, source, via_cost=via_cost, w_v=w.clone())
+    _assert_distances_match(d_explicit, d_iso)
+
+
+def test_anisotropic_factored_matches_dijkstra():
+    """Factored per-layer (h_mult, v_mult) costs match the dijkstra reference."""
+    torch.manual_seed(11)
+    L, H, W = 3, 14, 14
+    w = torch.rand(L, H, W) + 0.1
+    w[0, 6, 2:12] = math.inf
+    w[2, 3:11, 7] = math.inf
+    # Mimic gf180mcuD on 3 layers: M1=H-pref, M2=V-pref, M3=H-pref.
+    h_mult = [1.0, 8.0, 1.0]
+    v_mult = [8.0, 1.0, 8.0]
+    w_h, w_v = axis_costs(w, h_mult, v_mult)
+    source = (0, 0, 0)
+    via_cost = 0.7
+    d_sweep, _ = sweep_sssp_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    d_ref = dijkstra_grid_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    _assert_distances_match(d_sweep, d_ref, atol=5e-2)
+
+
+def test_anisotropic_prefers_via_to_cheap_axis():
+    """Two layers: layer 0 only allows cheap horizontal moves, layer 1 only
+    allows cheap vertical moves. Routing diagonally must use both layers."""
+    H, W = 8, 8
+    L = 2
+    w = torch.ones(L, H, W)
+    # Layer 0: H cheap (1), V expensive (50).
+    # Layer 1: H expensive (50), V cheap (1).
+    h_mult = [1.0, 50.0]
+    v_mult = [50.0, 1.0]
+    w_h, w_v = axis_costs(w, h_mult, v_mult)
+    source = (0, 0, 0)
+    sink = (0, H - 1, W - 1)
+    via_cost = 0.5
+    d, _ = sweep_sssp_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    path = backtrace_3d(
+        d.cpu(), w_h.cpu(), source, sink, via_cost=via_cost, w_v=w_v.cpu()
+    )
+    assert path is not None
+    assert path[0] == source
+    assert path[-1] == sink
+    layers_used = {p[0] for p in path}
+    assert 1 in layers_used, "anisotropy must drive the router off-layer for V moves"
+
+
+def test_anisotropic_obstacle_only_blocks_its_axis():
+    """A cell with w_h=inf, w_v=finite should be enterable vertically and
+    exit-able as a via-landing site, but not enterable horizontally."""
+    H, W = 6, 6
+    L = 2
+    w_h = torch.ones(L, H, W)
+    w_v = torch.ones(L, H, W)
+    # Pillar of horizontal-blocked cells at column 3 of layer 0 -- you can
+    # still traverse it vertically.
+    w_h[0, :, 3] = math.inf
+    source = (0, 0, 0)
+    via_cost = 0.5
+    d, _ = sweep_sssp_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    d_ref = dijkstra_grid_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    _assert_distances_match(d, d_ref, atol=5e-2)
+    # The cell (0, 3, 3) is H-blocked. Approaching from (0, 2, 3) or (0, 4, 3)
+    # is a V move (di != 0), which is allowed -- so it must be finite-reachable.
+    assert torch.isfinite(d[0, 3, 3])
+
+
+def test_anisotropic_backtrace_path_validity():
+    """Backtrace under anisotropic costs returns a path whose summed
+    per-edge axis-aware cost matches d[sink]."""
+    torch.manual_seed(12)
+    L, H, W = 3, 10, 10
+    w = torch.rand(L, H, W) + 0.1
+    h_mult = [1.0, 5.0, 1.0]
+    v_mult = [5.0, 1.0, 5.0]
+    w_h, w_v = axis_costs(w, h_mult, v_mult)
+    source = (0, 0, 0)
+    sink = (2, 9, 9)
+    via_cost = 0.5
+    d, _ = sweep_sssp_3d(w_h, source, via_cost=via_cost, w_v=w_v)
+    path = backtrace_3d(
+        d.cpu(), w_h.cpu(), source, sink, via_cost=via_cost, w_v=w_v.cpu()
+    )
+    assert path is not None
+    assert path[0] == source
+    assert path[-1] == sink
+    # Walk the path summing axis-aware costs; must match d[sink] to within atol.
+    total = 0.0
+    for (l1, i1, j1), (l2, i2, j2) in zip(path, path[1:]):
+        if l1 == l2 and i1 == i2 and abs(j1 - j2) == 1:
+            total += float(w_h[l2, i2, j2])
+        elif l1 == l2 and j1 == j2 and abs(i1 - i2) == 1:
+            total += float(w_v[l2, i2, j2])
+        elif abs(l1 - l2) == 1 and i1 == i2 and j1 == j2:
+            total += via_cost
+        else:
+            raise AssertionError(f"non-adjacent step {(l1, i1, j1)} -> {(l2, i2, j2)}")
+    assert abs(total - float(d[sink])) <= 5e-2, (
+        f"path cost {total} disagrees with d[sink]={float(d[sink])}"
+    )
+
+
+def test_axis_costs_preserves_obstacles():
+    """axis_costs must leave inf cells as inf in both output tensors regardless
+    of the per-layer multiplier."""
+    L, H, W = 3, 5, 5
+    w = torch.ones(L, H, W)
+    w[1, 2, 2] = math.inf
+    w_h, w_v = axis_costs(w, [1.0, 10.0, 1.0], [10.0, 1.0, 10.0])
+    assert math.isinf(float(w_h[1, 2, 2]))
+    assert math.isinf(float(w_v[1, 2, 2]))
+    assert float(w_h[0, 0, 0]) == 1.0
+    assert float(w_v[0, 0, 0]) == 10.0
+    assert float(w_h[1, 0, 0]) == 10.0
+    assert float(w_v[1, 0, 0]) == 1.0

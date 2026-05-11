@@ -124,23 +124,43 @@ def route_nets_3d(
     nets: list[tuple[tuple[int, int, int], tuple[int, int, int]]],
     via_cost: float = 1.0,
     reserve_pins: bool = True,
+    w_v: torch.Tensor | None = None,
 ) -> list[Net3DResult]:
     """Route nets sequentially on a multi-layer grid with via transitions.
 
     Args:
-        w: (L, H, W) tensor of cell-entry costs. inf for obstacles.
+        w: (L, H, W) tensor of cell-entry costs for axis=2 ("H") moves.
+            Also used for axis=1 ("V") moves when `w_v` is not given.
+            inf for obstacles.
         nets: ordered list of ((layer, row, col), (layer, row, col)) pairs.
         via_cost: edge weight for one via transition between adjacent layers.
         reserve_pins: if True, all pin cells (across all layers) are reserved
             as obstacles before routing; each net's own pins are temporarily
             un-reserved while it routes.
+        w_v: optional (L, H, W) cost tensor for axis=1 ("V") moves. Use
+            `gpu_pnr.sweep.axis_costs` to build (w, w_v) from per-layer
+            preferred-direction multipliers. When set, pin reservation and
+            committed-route obstacles are applied to both tensors so pin
+            and wire blocking is consistent across axes.
 
     Returns:
         list of Net3DResult in input order.
     """
     inf_val = torch.tensor(float("inf"), device=w.device, dtype=w.dtype)
     w_cur = w.clone()
+    w_v_cur = w_v.clone() if w_v is not None else None
     routed_cells: set[tuple[int, int, int]] = set()
+
+    def _set_inf(ijk: tuple[int, int, int]) -> None:
+        w_cur[ijk] = inf_val
+        if w_v_cur is not None:
+            w_v_cur[ijk] = inf_val
+
+    def _restore(ijk: tuple[int, int, int]) -> None:
+        w_cur[ijk] = w[ijk]
+        if w_v_cur is not None:
+            assert w_v is not None
+            w_v_cur[ijk] = w_v[ijk]
 
     if reserve_pins:
         pin_cells: set[tuple[int, int, int]] = set()
@@ -149,7 +169,7 @@ def route_nets_3d(
             pin_cells.add(t)
         for ijk in pin_cells:
             if _is_finite(w_cur, ijk):
-                w_cur[ijk] = inf_val
+                _set_inf(ijk)
 
     results: list[Net3DResult] = []
     for source, sink in nets:
@@ -161,21 +181,27 @@ def route_nets_3d(
             continue
 
         if reserve_pins:
-            w_cur[source] = w[source]
-            w_cur[sink] = w[sink]
+            _restore(source)
+            _restore(sink)
 
-        d, _ = sweep_sssp_3d(w_cur, source, via_cost=via_cost)
+        d, _ = sweep_sssp_3d(w_cur, source, via_cost=via_cost, w_v=w_v_cur)
+        w_v_for_backtrace = w_v_cur.cpu() if w_v_cur is not None else None
         path = backtrace_3d(
-            d.cpu(), w_cur.cpu(), source, sink, via_cost=via_cost
+            d.cpu(),
+            w_cur.cpu(),
+            source,
+            sink,
+            via_cost=via_cost,
+            w_v=w_v_for_backtrace,
         )
 
         if path is not None:
             for ijk in path:
-                w_cur[ijk] = inf_val
+                _set_inf(ijk)
                 routed_cells.add(ijk)
         elif reserve_pins:
-            w_cur[source] = inf_val
-            w_cur[sink] = inf_val
+            _set_inf(source)
+            _set_inf(sink)
 
         results.append(Net3DResult(source, sink, path))
 

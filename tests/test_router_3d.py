@@ -7,6 +7,7 @@ import math
 import torch
 
 from gpu_pnr.router import route_nets_3d
+from gpu_pnr.sweep import axis_costs
 
 
 def _path_is_valid(path, w):
@@ -114,3 +115,44 @@ def test_obstacle_layer_forces_via_detour():
     assert _path_is_valid(p0, w)
     layers_used = {p[0] for p in p0}
     assert 1 in layers_used
+
+
+def test_anisotropic_route_uses_layer_with_cheap_axis():
+    """Layer 0 cheap for H, expensive for V; layer 1 cheap for V, expensive
+    for H. A diagonal route should hop layers to keep each segment on its
+    cheap axis."""
+    H, W = 8, 8
+    L = 2
+    w = torch.ones(L, H, W)
+    w_h, w_v = axis_costs(w, [1.0, 30.0], [30.0, 1.0])
+    nets = [((0, 0, 0), (0, H - 1, W - 1))]
+    results = route_nets_3d(w_h, nets, via_cost=0.5, w_v=w_v)
+    path = results[0].path
+    assert path is not None
+    layers_used = {p[0] for p in path}
+    assert 1 in layers_used, "anisotropy should drive the router off layer 0 for V"
+
+
+def test_anisotropic_pin_reservation_blocks_both_axes():
+    """Reserving pins under anisotropy must obstruct both w_h and w_v at pin
+    cells so the second net can't run a wire through the first net's pin."""
+    H, W = 5, 5
+    L = 2
+    w = torch.ones(L, H, W)
+    # Layer 0 prefers H; layer 1 prefers V.
+    w_h, w_v = axis_costs(w, [1.0, 10.0], [10.0, 1.0])
+    # Net 0's natural H route on layer 0 runs through (0,2,2), which is
+    # Net 1's source. Picked the geometry deliberately so the anisotropy
+    # picks layer-0 H over a layer-1 via-stack (vias=10, 4 H cells=4 << 20).
+    nets = [
+        ((0, 2, 0), (0, 2, 4)),
+        ((0, 2, 2), (0, 0, 4)),
+    ]
+    no_res = route_nets_3d(w_h, nets, via_cost=10.0, reserve_pins=False, w_v=w_v)
+    with_res = route_nets_3d(w_h, nets, via_cost=10.0, reserve_pins=True, w_v=w_v)
+    assert no_res[0].routed
+    assert no_res[1].path is None, (
+        "without reservation, first net consumes (0,2,2) which is second's source"
+    )
+    assert with_res[0].routed
+    assert with_res[1].routed

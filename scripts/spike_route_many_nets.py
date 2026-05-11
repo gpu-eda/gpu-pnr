@@ -9,13 +9,15 @@ SEG_BARRIER appropriate to each net's geometry.
 Reports aggregate stats including a comparison to TritonRoute's wire and
 via counts (parsed from final/def/...).
 
-The optional `m1_cost` argument multiplies the cost of every Metal1 wire
-cell by that penalty. With m1_cost >> 1 the router avoids using M1 as
-through-wire and instead via-stacks from each pin up to M2+ for the wire
-body -- approximating gf180mcuD's pin-access-only convention for M1.
+The optional `off_mult` argument enables per-layer preferred-direction
+modelling: each layer's non-preferred axis is multiplied by `off_mult`,
+the preferred axis stays at 1.0. gf180mcuD's alternation is
+M1=H, M2=V, M3=H, M4=V, M5=H. With off_mult >> 1 the router via-stacks
+between layers so each wire segment travels along its layer's cheap axis,
+approximating real ASIC preferred-direction routing.
 
-Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [M1_COST]
-  N defaults to 50, SEED defaults to 0, M1_COST defaults to 1.0.
+Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT]
+  N defaults to 50, SEED defaults to 0, OFF_MULT defaults to 1.0 (isotropic).
 """
 
 from __future__ import annotations
@@ -23,8 +25,6 @@ from __future__ import annotations
 import random
 import sys
 import time
-
-import torch
 
 from _hazard3_io import (
     FINAL_DEF,
@@ -37,15 +37,31 @@ from _hazard3_io import (
     rect_center_to_grid,
 )
 from gpu_pnr.router import route_nets_3d
+from gpu_pnr.sweep import axis_costs
+
+# gf180mcuD preferred direction per metal layer, aligned with LAYER_ORDER.
+PREFERRED_DIRECTION = ["H", "V", "H", "V", "H"]
 
 
 def main() -> None:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 50
     seed = int(sys.argv[2]) if len(sys.argv) > 2 else 0
-    m1_cost = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
+    off_mult = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
     random.seed(seed)
-    if m1_cost != 1.0:
-        print(f"M1 wire-cost penalty: {m1_cost}x  (pin-access-only approximation)")
+    h_mult: list[float] | None
+    v_mult: list[float] | None
+    if off_mult != 1.0:
+        assert len(PREFERRED_DIRECTION) == len(LAYER_ORDER)
+        h_mult = [1.0 if d == "H" else off_mult for d in PREFERRED_DIRECTION]
+        v_mult = [1.0 if d == "V" else off_mult for d in PREFERRED_DIRECTION]
+        print(
+            f"Preferred-direction off-axis multiplier: {off_mult}x\n"
+            f"  h_mult per layer: {h_mult}\n"
+            f"  v_mult per layer: {v_mult}"
+        )
+    else:
+        h_mult = None
+        v_mult = None
 
     print(f"Loading guides from {GUIDE.name}...")
     all_nets = parse_guides(GUIDE)
@@ -87,14 +103,10 @@ def main() -> None:
         # routing is a real bug we want to see.
         try:
             w, origin = build_grid(rects)
-            if m1_cost != 1.0:
-                # Apply pin-access-only penalty on M1 wire cells. Source/sink
-                # land on M1 too, but Phase 3.4's edge model doesn't charge
-                # w[dest] on a via arrival, so via-stacking off M1 to M2+ for
-                # the wire body and back down at the sink is the natural
-                # behavior with this penalty.
-                m1 = w[0]
-                w[0] = torch.where(torch.isinf(m1), m1, m1 * m1_cost)
+            if h_mult is not None and v_mult is not None:
+                w_h, w_v = axis_costs(w, h_mult, v_mult)
+            else:
+                w_h, w_v = w, None
             metal1 = [r for r in rects if r[4] == "Metal1"]
             source = rect_center_to_grid(metal1[0], origin)
             sink = rect_center_to_grid(metal1[1], origin)
@@ -102,7 +114,9 @@ def main() -> None:
             failures.append((net_name, f"setup: {type(e).__name__}: {e}"))
             continue
         t0 = time.perf_counter()
-        results = route_nets_3d(w, [(source, sink)], via_cost=via_cost)
+        results = route_nets_3d(
+            w_h, [(source, sink)], via_cost=via_cost, w_v=w_v
+        )
         t1 = time.perf_counter()
         total_time_ms += (t1 - t0) * 1000
         res = results[0]
