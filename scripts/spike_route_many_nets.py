@@ -17,13 +17,17 @@ heuristics on top: each layer's non-preferred axis is multiplied by
 via-stacks between layers so each wire segment travels along its layer's
 cheap axis.
 
-Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT] [M1_PENALTY] [NO_PDK_RULES]
+Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT] [M1_PENALTY] [NO_PDK_RULES] [MULTIPIN]
   N defaults to 50, SEED defaults to 0, OFF_MULT defaults to 1.0 (isotropic),
   M1_PENALTY defaults to 1.0 (a debug knob -- redundant under PDK rules
   but kept for ablation studies).
   NO_PDK_RULES (0/1, default 0): when 1, the M1-as-pin-only PDK rule
   is NOT applied; this is the legacy "M1 is freely routable" mode
   retained for comparison with the pre-PDK-rule cost model.
+  MULTIPIN (0/1, default 0): when 1, sample 3+-pin nets only and route
+  them via route_multipin_nets_3d (incremental tree growth). When 0
+  the spike samples 2-pin nets only and uses route_nets_3d, preserving
+  historical TR-comparison numbers.
 """
 
 from __future__ import annotations
@@ -45,7 +49,7 @@ from _hazard3_io import (
     preferred_direction_multipliers,
     rect_center_to_grid,
 )
-from gpu_pnr.router import route_nets_3d
+from gpu_pnr.router import route_multipin_nets_3d, route_nets_3d
 from gpu_pnr.sweep import axis_costs
 
 PDK = GF180MCUD
@@ -57,6 +61,7 @@ def main() -> None:
     off_mult = float(sys.argv[3]) if len(sys.argv) > 3 else 1.0
     m1_penalty = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0
     no_pdk_rules = bool(int(sys.argv[5])) if len(sys.argv) > 5 else False
+    multipin = bool(int(sys.argv[6])) if len(sys.argv) > 6 else False
     random.seed(seed)
     apply_rules = not no_pdk_rules
     if no_pdk_rules:
@@ -80,11 +85,18 @@ def main() -> None:
 
     print(f"Loading guides from {GUIDE.name}...")
     all_nets = parse_guides(GUIDE)
-    two_pin = [
-        (name, rects) for name, rects in all_nets.items()
-        if sum(1 for r in rects if r[4] == "Metal1") == 2
-    ]
-    print(f"  {len(all_nets)} total nets, {len(two_pin)} are 2-pin")
+    pin_count_target = ">=3 (multi-pin)" if multipin else "exactly 2 (point-to-point)"
+    if multipin:
+        candidates = [
+            (name, rects) for name, rects in all_nets.items()
+            if sum(1 for r in rects if r[4] == "Metal1") >= 3
+        ]
+    else:
+        candidates = [
+            (name, rects) for name, rects in all_nets.items()
+            if sum(1 for r in rects if r[4] == "Metal1") == 2
+        ]
+    print(f"  {len(all_nets)} total nets, {len(candidates)} match (pins {pin_count_target})")
 
     print(f"Loading TritonRoute output from {FINAL_DEF.name}...")
     triton = parse_def_nets(FINAL_DEF)
@@ -93,9 +105,9 @@ def main() -> None:
     # Sort by total guide-rectangle count and pick the smallest N -- keeps the
     # spike fast and avoids degenerate cases where a single net's guide spans
     # most of the chip.
-    two_pin.sort(key=lambda nr: len(nr[1]))
-    sample = two_pin[:n]
-    print(f"  picking smallest {len(sample)} 2-pin nets for the spike\n")
+    candidates.sort(key=lambda nr: len(nr[1]))
+    sample = candidates[:n]
+    print(f"  picking smallest {len(sample)} nets for the spike\n")
 
     via_cost = 5.0
     total_routed = 0
@@ -119,10 +131,9 @@ def main() -> None:
         try:
             w, origin = build_grid(rects)
             metal1 = [r for r in rects if r[4] == "Metal1"]
-            source = rect_center_to_grid(metal1[0], origin)
-            sink = rect_center_to_grid(metal1[1], origin)
+            pins = [rect_center_to_grid(r, origin) for r in metal1]
             if apply_rules:
-                apply_pin_access_rules(w, PDK, [source, sink])
+                apply_pin_access_rules(w, PDK, pins)
             if h_mult is not None and v_mult is not None:
                 w_h, w_v = axis_costs(w, h_mult, v_mult)
             else:
@@ -131,23 +142,46 @@ def main() -> None:
             failures.append((net_name, f"setup: {type(e).__name__}: {e}"))
             continue
         t0 = time.perf_counter()
-        results = route_nets_3d(
-            w_h, [(source, sink)], via_cost=via_cost, w_v=w_v
-        )
-        t1 = time.perf_counter()
-        total_time_ms += (t1 - t0) * 1000
-        res = results[0]
-        if res.path is None:
-            failures.append((net_name, "router returned None"))
-            continue
-        total_routed += 1
-        total_wl_cells += res.length
-        via_count = sum(
-            1 for (la, _, _), (lb, _, _) in zip(res.path, res.path[1:]) if la != lb
-        )
-        total_vias += via_count
-        for lyr_idx in {p[0] for p in res.path}:
-            route_counts_by_layer[LAYER_ORDER[lyr_idx]] += 1
+        if multipin:
+            mp_res = route_multipin_nets_3d(
+                w_h, [pins], via_cost=via_cost, w_v=w_v
+            )[0]
+            t1 = time.perf_counter()
+            total_time_ms += (t1 - t0) * 1000
+            if not mp_res.routed or mp_res.paths is None:
+                failures.append((net_name, "router returned None"))
+                continue
+            cells = mp_res.cells
+            wirelength = max(0, len(cells) - len(pins))
+            # Via count: across all attachment edges, count layer transitions.
+            via_count = 0
+            for p in mp_res.paths:
+                via_count += sum(
+                    1 for (la, _, _), (lb, _, _) in zip(p, p[1:]) if la != lb
+                )
+            total_routed += 1
+            total_wl_cells += wirelength
+            total_vias += via_count
+            for lyr_idx in {c[0] for c in cells}:
+                route_counts_by_layer[LAYER_ORDER[lyr_idx]] += 1
+        else:
+            results = route_nets_3d(
+                w_h, [(pins[0], pins[1])], via_cost=via_cost, w_v=w_v
+            )
+            t1 = time.perf_counter()
+            total_time_ms += (t1 - t0) * 1000
+            res = results[0]
+            if res.path is None:
+                failures.append((net_name, "router returned None"))
+                continue
+            total_routed += 1
+            total_wl_cells += res.length
+            via_count = sum(
+                1 for (la, _, _), (lb, _, _) in zip(res.path, res.path[1:]) if la != lb
+            )
+            total_vias += via_count
+            for lyr_idx in {p[0] for p in res.path}:
+                route_counts_by_layer[LAYER_ORDER[lyr_idx]] += 1
         if net_name in triton:
             triton_wl_dbu, triton_vc = triton[net_name]
             # Assumes uniform 200nm pitch across all layers (gf180mcuD); a

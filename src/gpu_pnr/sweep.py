@@ -325,6 +325,7 @@ def sweep_sssp_3d(
     check_every: int = 8,
     seg_barrier: float | None = None,
     w_v: torch.Tensor | None = None,
+    extra_sources: Sequence[tuple[int, int, int]] = (),
 ) -> tuple[torch.Tensor, int]:
     """Compute shortest-path distances on a multi-layer grid via sweep iteration.
 
@@ -367,6 +368,12 @@ def sweep_sssp_3d(
             `w` is used for both axes (isotropic). Use `axis_costs` to build
             (w, w_v) from a base tensor and per-layer preferred-direction
             multipliers.
+        extra_sources: additional cells to seed at distance 0, beyond the
+            primary `source`. Used by the multi-pin router to seed the
+            already-committed tree as a source set: a sweep from a tree of
+            many cells computes "distance to the nearest tree cell" at every
+            other point, which is the correct quantity for picking the next
+            attachment edge in an incremental maze route.
 
     Returns:
         (d, iters) where d is the (L, H, W) distance tensor.
@@ -375,6 +382,8 @@ def sweep_sssp_3d(
     d = torch.full_like(w, float("inf"))
     sl, sr, sc = source
     d[sl, sr, sc] = 0.0
+    for el, er, ec in extra_sources:
+        d[el, er, ec] = 0.0
     mask_h = _obstacle_mask(w)
     if w_v is not None:
         mask_v = _obstacle_mask(w_v)
@@ -494,6 +503,7 @@ def backtrace_3d(
     via_cost: float = 1.0,
     atol: float = 1e-5,
     w_v: torch.Tensor | None = None,
+    extra_sources: Sequence[tuple[int, int, int]] = (),
 ) -> list[tuple[int, int, int]] | None:
     """Reconstruct a shortest 3D path from source to sink.
 
@@ -505,12 +515,19 @@ def backtrace_3d(
 
     Falls back to cross-layer via neighbors at the same (r, c) on the layer
     above or below (predecessor distance = d[cur] - via_cost).
+
+    With `extra_sources` non-empty, the walk terminates upon reaching `source`
+    OR any cell in `extra_sources` -- the first complete predecessor chain
+    back to any seed cell wins. Used by the multi-pin router to attach a new
+    pin to the nearest cell of the existing committed tree, rather than
+    walking all the way back to a designated root.
     """
     if w_v is None:
         w_v = w
     sl, sr, sc = source
     tl, ti, tj = sink
     L, H, W = d.shape
+    terminal_cells: set[tuple[int, int, int]] = {(sl, sr, sc), *extra_sources}
 
     if not torch.isfinite(d[tl, ti, tj]):
         return None
@@ -518,7 +535,7 @@ def backtrace_3d(
     path: list[tuple[int, int, int]] = [(tl, ti, tj)]
     cur_l, cur_i, cur_j = tl, ti, tj
 
-    while (cur_l, cur_i, cur_j) != (sl, sr, sc):
+    while (cur_l, cur_i, cur_j) not in terminal_cells:
         h_target = (d[cur_l, cur_i, cur_j] - w[cur_l, cur_i, cur_j]).item()
         v_target = (d[cur_l, cur_i, cur_j] - w_v[cur_l, cur_i, cur_j]).item()
         via_target = (d[cur_l, cur_i, cur_j] - via_cost).item()

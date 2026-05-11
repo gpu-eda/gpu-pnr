@@ -310,3 +310,66 @@ def test_axis_costs_preserves_obstacles():
     assert float(w_v[0, 0, 0]) == 10.0
     assert float(w_h[1, 0, 0]) == 10.0
     assert float(w_v[1, 0, 0]) == 1.0
+
+
+def test_extra_sources_seed_zero_distance():
+    """Cells passed via extra_sources start at d=0 alongside the primary
+    source; d at any extra source must be 0 after the sweep."""
+    L, H, W = 2, 8, 8
+    w = torch.ones(L, H, W)
+    primary = (0, 0, 0)
+    extras = [(0, 4, 4), (1, 7, 7)]
+    d, _ = sweep_sssp_3d(w, primary, via_cost=1.0, extra_sources=extras)
+    assert float(d[primary]) == 0.0
+    for e in extras:
+        assert float(d[e]) == 0.0, f"extra source {e} did not survive sweep"
+
+
+def test_extra_sources_match_min_over_dijkstra_runs():
+    """SSSP from multiple sources equals the element-wise min of SSSP runs
+    from each source individually -- this is the canonical multi-source
+    semantic."""
+    torch.manual_seed(20)
+    L, H, W = 3, 10, 10
+    w = torch.rand(L, H, W) + 0.1
+    w[1, 5, 3:8] = math.inf
+    via_cost = 0.6
+    sources = [(0, 0, 0), (2, 9, 9), (1, 3, 8)]
+    d_multi, _ = sweep_sssp_3d(
+        w, sources[0], via_cost=via_cost, extra_sources=sources[1:]
+    )
+    d_individual = [
+        sweep_sssp_3d(w, s, via_cost=via_cost)[0] for s in sources
+    ]
+    d_stack = torch.stack(d_individual, dim=0)
+    d_expected = d_stack.amin(dim=0)
+    finite = torch.isfinite(d_expected).cpu()
+    assert torch.allclose(
+        d_multi.cpu()[finite], d_expected.cpu()[finite], atol=5e-2
+    )
+
+
+def test_backtrace_extra_sources_terminates_at_any_seed():
+    """When extra_sources is non-empty, backtrace walks back to whichever
+    source cell is on the shortest predecessor chain, not just the named
+    primary source."""
+    L, H, W = 1, 6, 6
+    w = torch.ones(L, H, W)
+    # Sink is closer to the extra source than to the primary.
+    primary = (0, 0, 0)
+    extras = [(0, 5, 5)]
+    sink = (0, 5, 4)
+    d, _ = sweep_sssp_3d(w, primary, via_cost=1.0, extra_sources=extras)
+    path = backtrace_3d(
+        d.cpu(), w.cpu(), primary, sink, via_cost=1.0,
+        extra_sources=extras,
+    )
+    assert path is not None
+    assert path[-1] == sink
+    # The first cell in the reversed (path-ordered) list is whichever
+    # terminal we reached. With the extra source closer, we expect it
+    # there, not the distant primary.
+    assert path[0] == extras[0], (
+        f"backtrace should attach at the nearer extra source {extras[0]}, "
+        f"got {path[0]}"
+    )

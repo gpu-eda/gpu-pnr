@@ -53,6 +53,35 @@ class Net3DResult:
         return len(self.path) - 1 if self.path else 0
 
 
+@dataclass
+class MultiPin3DResult:
+    """Result for an N-pin net routed with `route_multipin_nets_3d`.
+
+    `paths` is a list of per-attachment-edge cell sequences, in routing
+    order. The first entry is the seed pin (singleton list); each
+    subsequent entry is the cell sequence from a newly attached pin
+    back to the existing tree. `cells` deduplicates across edges and
+    gives the full footprint of the routed tree.
+    """
+
+    pins: list[tuple[int, int, int]]
+    paths: list[list[tuple[int, int, int]]] | None
+
+    @property
+    def routed(self) -> bool:
+        return self.paths is not None
+
+    @property
+    def cells(self) -> set[tuple[int, int, int]]:
+        if self.paths is None:
+            return set()
+        return {c for p in self.paths for c in p}
+
+    @property
+    def length(self) -> int:
+        return max(0, len(self.cells) - len(self.pins)) if self.paths else 0
+
+
 def _is_finite(w: torch.Tensor, ij: tuple[int, ...]) -> bool:
     return bool(torch.isfinite(w[ij]).item())
 
@@ -204,5 +233,131 @@ def route_nets_3d(
             _set_inf(sink)
 
         results.append(Net3DResult(source, sink, path))
+
+    return results
+
+
+def route_multipin_nets_3d(
+    w: torch.Tensor,
+    nets: list[list[tuple[int, int, int]]],
+    via_cost: float = 1.0,
+    reserve_pins: bool = True,
+    w_v: torch.Tensor | None = None,
+) -> list[MultiPin3DResult]:
+    """Route N-pin nets sequentially via incremental tree growth.
+
+    Each net is a list of pin coordinates (>= 2). For each net:
+      1. Seed the tree with `pins[0]`.
+      2. Run SSSP from the current tree (all tree cells at distance 0
+         via `extra_sources`). Distances at the other pins indicate
+         their cost-to-attach.
+      3. Pick the unrouted pin with smallest finite distance; backtrace
+         from it to any tree cell. Add the path to the tree.
+      4. Repeat until all pins are connected (or any backtrace fails,
+         in which case the net is marked unrouted).
+
+    Pin reservation behaves the same as `route_nets_3d`: when enabled,
+    all pin cells across all nets are reserved as obstacles up front;
+    a net's own pins are temporarily restored while it routes. Once a
+    net is fully routed, every tree cell is marked inf so subsequent
+    nets cannot share wire.
+
+    For a 2-pin net this collapses to the same behaviour as
+    `route_nets_3d`, just with a slightly heavier code path.
+    """
+    inf_val = torch.tensor(float("inf"), device=w.device, dtype=w.dtype)
+    w_cur = w.clone()
+    w_v_cur = w_v.clone() if w_v is not None else None
+    routed_cells: set[tuple[int, int, int]] = set()
+
+    def _set_inf(ijk: tuple[int, int, int]) -> None:
+        w_cur[ijk] = inf_val
+        if w_v_cur is not None:
+            w_v_cur[ijk] = inf_val
+
+    def _restore(ijk: tuple[int, int, int]) -> None:
+        w_cur[ijk] = w[ijk]
+        if w_v_cur is not None:
+            assert w_v is not None
+            w_v_cur[ijk] = w_v[ijk]
+
+    if reserve_pins:
+        pin_cells: set[tuple[int, int, int]] = set()
+        for pins in nets:
+            pin_cells.update(pins)
+        for ijk in pin_cells:
+            if _is_finite(w_cur, ijk):
+                _set_inf(ijk)
+
+    results: list[MultiPin3DResult] = []
+    for pins in nets:
+        if len(pins) < 2:
+            results.append(MultiPin3DResult(list(pins), None))
+            continue
+        if any(p in routed_cells for p in pins):
+            results.append(MultiPin3DResult(list(pins), None))
+            continue
+        if not all(_is_finite(w, p) for p in pins):
+            results.append(MultiPin3DResult(list(pins), None))
+            continue
+
+        if reserve_pins:
+            for p in pins:
+                _restore(p)
+
+        tree: set[tuple[int, int, int]] = {pins[0]}
+        unrouted: set[tuple[int, int, int]] = set(pins[1:])
+        paths: list[list[tuple[int, int, int]]] = [[pins[0]]]
+        failed = False
+
+        while unrouted and not failed:
+            seed = next(iter(tree))
+            extras = tuple(c for c in tree if c != seed)
+            d, _ = sweep_sssp_3d(
+                w_cur, seed, via_cost=via_cost, w_v=w_v_cur,
+                extra_sources=extras,
+            )
+            d_cpu = d.cpu()
+            best_pin: tuple[int, int, int] | None = None
+            best_dist = float("inf")
+            for p in unrouted:
+                dp = float(d_cpu[p].item())
+                if dp < best_dist:
+                    best_dist = dp
+                    best_pin = p
+            if best_pin is None or best_dist == float("inf"):
+                failed = True
+                break
+            w_v_for_backtrace = w_v_cur.cpu() if w_v_cur is not None else None
+            path = backtrace_3d(
+                d_cpu,
+                w_cur.cpu(),
+                seed,
+                best_pin,
+                via_cost=via_cost,
+                w_v=w_v_for_backtrace,
+                extra_sources=extras,
+            )
+            if path is None:
+                failed = True
+                break
+            paths.append(path)
+            tree.update(path)
+            unrouted.discard(best_pin)
+            # Mark the freshly-attached cells as legal tree cells for the
+            # next sweep: they're already non-inf in w_cur (we restored
+            # them at the start of this net, or they came from build_grid).
+            # Subsequent sweeps treat them as sources via extra_sources.
+
+        if failed:
+            if reserve_pins:
+                for p in pins:
+                    _set_inf(p)
+            results.append(MultiPin3DResult(list(pins), None))
+        else:
+            for c in tree:
+                _set_inf(c)
+                routed_cells.add(c)
+            results.append(MultiPin3DResult(list(pins), paths))
 
     return results

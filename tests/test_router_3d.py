@@ -6,7 +6,7 @@ import math
 
 import torch
 
-from gpu_pnr.router import route_nets_3d
+from gpu_pnr.router import route_multipin_nets_3d, route_nets_3d
 from gpu_pnr.sweep import axis_costs
 
 
@@ -131,6 +131,104 @@ def test_anisotropic_route_uses_layer_with_cheap_axis():
     assert path is not None
     layers_used = {p[0] for p in path}
     assert 1 in layers_used, "anisotropy should drive the router off layer 0 for V"
+
+
+def _tree_is_connected(
+    paths: list[list[tuple[int, int, int]]],
+    pins: list[tuple[int, int, int]],
+) -> bool:
+    """Check that all pins land in the union of paths and that path cells
+    form a single connected component."""
+    if not paths:
+        return False
+    cells = {c for p in paths for c in p}
+    if not all(pin in cells for pin in pins):
+        return False
+    # BFS from any starting cell, walking 4-connected in-layer + via cross-layer.
+    start = next(iter(cells))
+    seen = {start}
+    frontier = [start]
+    while frontier:
+        nxt = []
+        for cl, ci, cj in frontier:
+            neighbours = [
+                (cl, ci - 1, cj), (cl, ci + 1, cj),
+                (cl, ci, cj - 1), (cl, ci, cj + 1),
+                (cl - 1, ci, cj), (cl + 1, ci, cj),
+            ]
+            for n in neighbours:
+                if n in cells and n not in seen:
+                    seen.add(n)
+                    nxt.append(n)
+        frontier = nxt
+    return seen == cells
+
+
+def test_multipin_three_pins_open_grid():
+    """3-pin net on an open grid; all pins reach a single connected tree."""
+    L, H, W = 2, 8, 8
+    w = torch.ones(L, H, W)
+    pins = [(0, 0, 0), (0, 7, 7), (1, 3, 3)]
+    results = route_multipin_nets_3d(w, [pins], via_cost=1.0)
+    assert len(results) == 1
+    res = results[0]
+    assert res.routed
+    assert res.paths is not None
+    assert len(res.paths) == len(pins), "expect one path per attachment edge"
+    assert _tree_is_connected(res.paths, pins)
+
+
+def test_multipin_four_pins_obstacle_detour():
+    """4-pin net where layer 0 has a wall; tree must use layer 1 to bridge."""
+    L, H, W = 2, 6, 6
+    w = torch.ones(L, H, W)
+    w[0, 3, :] = math.inf
+    pins = [(0, 0, 0), (0, 5, 0), (0, 0, 5), (0, 5, 5)]
+    results = route_multipin_nets_3d(w, [pins], via_cost=1.0)
+    res = results[0]
+    assert res.routed
+    assert res.paths is not None
+    assert _tree_is_connected(res.paths, pins)
+    layers_used = {c[0] for c in res.cells}
+    assert 1 in layers_used, "tree must hop to layer 1 to cross the wall"
+
+
+def test_multipin_two_pin_matches_2pin_router():
+    """2-pin nets should produce equivalent topology under both routers
+    (same set of visited cells, possibly with different orderings)."""
+    L, H, W = 2, 6, 6
+    w = torch.ones(L, H, W)
+    pins = [(0, 0, 0), (0, 5, 5)]
+    res_two = route_nets_3d(w, [(pins[0], pins[1])], via_cost=1.0)
+    res_multi = route_multipin_nets_3d(w, [pins], via_cost=1.0)
+    assert res_two[0].path is not None
+    assert res_multi[0].routed
+    assert set(res_two[0].path) == res_multi[0].cells
+
+
+def test_multipin_pin_reservation_blocks_other_net():
+    """Two 3-pin nets sharing no pin cells; reservation keeps trees disjoint."""
+    L, H, W = 2, 8, 8
+    w = torch.ones(L, H, W)
+    nets = [
+        [(0, 0, 0), (0, 0, 7), (0, 4, 3)],
+        [(0, 7, 0), (0, 7, 7), (0, 4, 5)],
+    ]
+    results = route_multipin_nets_3d(w, nets, via_cost=1.0)
+    assert all(r.routed for r in results)
+    cells_a = results[0].cells
+    cells_b = results[1].cells
+    assert cells_a.isdisjoint(cells_b)
+
+
+def test_multipin_blocked_pin_returns_unrouted():
+    """A pin on an inf cell should produce an unrouted result."""
+    L, H, W = 2, 5, 5
+    w = torch.ones(L, H, W)
+    w[0, 2, 2] = math.inf
+    pins = [(0, 0, 0), (0, 2, 2), (0, 4, 4)]
+    results = route_multipin_nets_3d(w, [pins], via_cost=1.0)
+    assert not results[0].routed
 
 
 def test_anisotropic_pin_reservation_blocks_both_axes():
