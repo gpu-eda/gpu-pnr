@@ -442,4 +442,66 @@ the `inf` mask automatically. Costs would then be cost weights;
 pin-only-ness would be a structural constraint, mirroring how real
 DR tools split technology rules from heuristic weights. Deferred
 until the cost-grid construction is refactored more broadly
-(probably during WS3.3).
+(probably during WS3.3). *Shipped 2026-05-11, commit `907f632`,
+[ADR 0011](adr/0011-pdk-rules-as-structural-constraints.md).*
+
+# Phase 3.2 — multi-pin nets
+
+`route_multipin_nets_3d` implements incremental tree growth on top of
+the per-axis 3D SSSP kernel (commit `a7aa2d5`,
+[plan deliverable 4](plans/phase3-detailed-routing.md#ws32--real-fixture-integration-hazard3-on-gf180mcud)).
+For an N-pin net the router seeds a tree at `pins[0]`, then iteratively
+runs SSSP from the current tree (every tree cell at distance 0 via the
+new `extra_sources` kwarg on `sweep_sssp_3d`), picks the unrouted pin
+with smallest distance, and backtraces to attach it. The kernel-level
+multi-source semantic is the canonical one: SSSP from `{s1, s2, ...}`
+equals the element-wise min of SSSP from each source individually,
+verified against Dijkstra in
+[`tests/test_sweep_3d.py`](../tests/test_sweep_3d.py).
+
+## TritonRoute comparison (smallest 500 multi-pin nets)
+
+| Metric | ours | TR | ratio |
+|---|---|---|---|
+| routed | 500 / 500 (100%) | — | — |
+| wirelength | 130,725 cells | 139,583 | **0.94×** |
+| vias | 1,671 | 2,773 | **0.60×** |
+| avg per-net time | 159 ms | — | — |
+
+Two surprising findings:
+
+1. **We use *less* wire than TR (0.94×).** Sequential nearest-pin
+   attachment produces tight trees on small per-net mini-grids. TR's
+   Steiner topology is more sprawling, partly because it can detour
+   off-guide and partly because it optimises for a different cost
+   model (DRC + RC, not just Manhattan length).
+2. **Our via count is 60% of TR's.** That's the per-via-pair-cost
+   story showing up unambiguously: TR uses Via2/Via3 transitions to
+   escape to upper layers that our scalar `via_cost=5` makes uniformly
+   expensive. With per-pair costs (next deliverable) reflecting
+   gf180mcuD's real M1↔M2 vs M2↔M3 asymmetry, we'd expect our via
+   ratio to climb toward 1.0×.
+
+## Layer occupancy
+
+Of the smallest 500 multi-pin nets, **85 (17%) used Metal3** — the
+first slice in any of our spike samples to show meaningful M3 use by
+our router. Multi-pin nets are larger and their guides include M3,
+unlocking the escape that the smaller 2-pin nets couldn't reach.
+Confirms that the per-net guide-locking constraint is the actual
+limiter, not the cost model.
+
+## Implementation notes
+
+- The kernel changes are additive: `sweep_sssp_3d(..., extra_sources=())`
+  and `backtrace_3d(..., extra_sources=())` default to the empty
+  sequence, preserving existing call sites and tests.
+- `MultiPin3DResult` exposes `paths: list[list[cell]]` (one per
+  attachment edge), `cells: set[cell]` (dedup'd footprint), and
+  `length: int` (cells − pins).
+- Per-net pin reservation works the same way as the 2-pin case: all
+  nets' pins are inf at the start; each net's pins are restored when
+  it routes; tree cells become inf after the net completes.
+- Multi-pin nets cost ~3× the per-net time of 2-pin nets because
+  each tree-attachment edge runs its own SSSP. For an N-pin net the
+  total work is N-1 sweeps.
