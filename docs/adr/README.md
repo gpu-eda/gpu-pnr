@@ -36,3 +36,4 @@ it. Never delete the old one.
 | 0007 | [HPWL-ascending net ordering as default](0007-hpwl-ascending-net-ordering.md) | Accepted 2026-05-10 |
 | 0008 | [Defer `route_nets_batched`; sweep-sharing only via tile decomposition](0008-defer-route-nets-batched.md) | Accepted 2026-05-10 |
 | 0009 | [Per-net independent grids for the Hazard3 spike](0009-per-net-grids.md) | Accepted 2026-05-11 |
+| 0010 | [Per-axis cost tensors (w, w_v) for preferred-direction routing](0010-per-axis-cost-tensors.md) | Accepted 2026-05-11 |

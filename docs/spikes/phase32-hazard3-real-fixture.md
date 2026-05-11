@@ -1,7 +1,9 @@
 # Spike — Phase 3.2: does the sweep kernel route real LibreLane geometry end-to-end?
 
-**Status:** Resolved (2026-05-11) — **YES**, with three follow-ons (preferred
-direction, multi-pin nets, per-via-pair via cost) deferred to the
+**Status:** Resolved (2026-05-11) — **YES**. Preferred-direction has since
+landed ([ADR 0010](../adr/0010-per-axis-cost-tensors.md), commit `eee87bf`)
+and ruled itself out as the cause of the residual TR gap; multi-pin nets
+and per-via-pair via cost remain deferred to the
 [Phase 3 plan](../plans/phase3-detailed-routing.md).
 
 ## Question
@@ -307,6 +309,56 @@ In rough priority order, post-comparison:
 4. **Whole-chip integration.** Replace per-net mini-grids with a
    chip-scale grid that tracks committed routes globally. Gates on
    (1) and probably tile decomposition (Phase 3.3) to fit at scale.
+
+## Preferred-direction experiment (landed 2026-05-11, commit `eee87bf`)
+
+`sweep_sssp_3d` / `route_nets_3d` were generalised to accept an optional
+per-axis cost tensor `w_v`; `axis_costs(w, h_mult, v_mult)` builds the
+factored (w_h, w_v) pair from gf180mcuD's per-layer alternation. The
+spike script's `m1_cost` knob was replaced by an `off_mult` arg.
+Implementation decision: [ADR 0010](../adr/0010-per-axis-cost-tensors.md).
+
+Per-net topology now matches the cost model — a pure-V Hazard3 net that
+previously ran illegal V wire on M1 now via-stacks to M2 for the wire
+body and back to M1 at the sink (2 vias, correct topology).
+
+### Aggregate TR comparison (off_mult=10)
+
+| Sample | wire ratio | via ratio | M1 use   | M2 use   | M3+ use |
+|--------|-----------|-----------|----------|----------|---------|
+| 50     | 1.08×     | 0.76×     | 50/50    | 50/50    | 0       |
+| 200    | 1.26×     | 0.78×     | 200/200  | 200/200  | 0       |
+| 500    | 1.36×     | 0.80×     | 500/500  | 500/500  | 0       |
+
+Numbers are **identical to the `m1_cost=10` table** above. The numbers
+saturate immediately — flat across `off_mult ∈ [2.0, 100.0]` at every
+sample size. For these small in-guide 2-pin nets, "M1 wire cost is
+expensive" and "per-layer preferred direction" produce the same
+topology: one via-stack at each pin and a single intermediate layer
+for the wire body.
+
+### Amendment to the "what this means" prediction above
+
+The original "what this tells us" section listed three candidates for
+the residual 20% via gap: preferred-direction transitions, per-via-pair
+cost asymmetry, and multi-pin Steiner topology. The preferred-direction
+candidate is now ruled out by data — its strongest implementation
+(option B in ADR 0010) produces TR numbers identical to the `m1_cost`
+knob. The two remaining candidates own the gap:
+
+1. **Per-via-pair cost asymmetry** ([plan deliverable 3](../plans/phase3-detailed-routing.md#ws32--real-fixture-integration-hazard3-on-gf180mcud)).
+   gf180mcuD's M1-M2 via differs from M3-M4 via in resistance and DRC.
+   Our scalar `via_cost` averages this away, which probably biases the
+   router toward over-using the M1-M2 pair.
+2. **Multi-pin Steiner topology** ([plan deliverable 2](../plans/phase3-detailed-routing.md#ws32--real-fixture-integration-hazard3-on-gf180mcud)).
+   Our 2-pin sample is a subset of larger nets in the actual fixture;
+   TritonRoute's Steiner trees add via hops that point-to-point
+   routing doesn't see, even on the "2-pin" subset.
+
+The wire-ratio drift (1.08× → 1.36× with sample size) likewise survives
+preferred-direction unchanged. Probably the same per-via-pair story —
+larger nets cross more layer pairs, where our averaged scalar
+diverges further from the real per-pair cost structure.
 
 ## Files added
 

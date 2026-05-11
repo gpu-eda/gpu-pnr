@@ -261,3 +261,65 @@ of the 3D graph, not just the 2D one — vias contribute up to L steps
 of latency on top of the H+W horizontal diameter. Adding a 3D bench is
 left for the next session, gated on whether 3.2 (real fixture) needs
 absolute numbers or only relative speedup vs CPU.
+
+# Phase 3.2 — preferred-direction (per-axis costs)
+
+`sweep_sssp_3d` and `route_nets_3d` now accept an optional `w_v`
+per-axis cost tensor (see [ADR 0010](adr/0010-per-axis-cost-tensors.md)).
+`scripts/spike_route_many_nets.py` replaces the old `m1_cost` knob
+with `off_mult`, which builds gf180mcuD's per-layer preferred-direction
+multipliers (M1=H, M2=V, M3=H, M4=V, M5=H) via `gpu_pnr.sweep.axis_costs`
+and passes them as `(w_h, w_v)` to the router.
+
+## TritonRoute comparison (off_mult sweep, N = 50 / 200 / 500)
+
+| Sample | wire ratio vs TR | via ratio vs TR | M1 use | M2 use | M3+ use |
+|--------|------------------|-----------------|--------|--------|---------|
+| 50     | 1.08×            | 0.76×           | 50/50  | 50/50  | 0       |
+| 200    | 1.26×            | 0.78×           | 200/200| 200/200| 0       |
+| 500    | 1.36×            | 0.80×           | 500/500| 500/500| 0       |
+
+Numbers are flat across `off_mult ∈ [2.0, 100.0]` — once the off-axis
+penalty exceeds the via-stack overhead (≈ 2× `via_cost`), the router
+commits to a fixed topology: via-stack at each pin from M1 to the
+nearest preferred-axis layer, traverse there, via-stack back. M3+ is
+never used at these in-guide 2-pin nets because using M3 instead of M1
+costs 4 extra vias and saves nothing (M3-H and M1-H carry identical
+unit cost; the spike's `via_cost=5` makes the swap a net loss for any
+realistic segment length).
+
+## Hypothesis comparison
+
+The preferred-direction handoff predicted that this slice would close
+the via-ratio toward 1.0× and flatten the 1.08× → 1.36× wire-ratio
+drift. Measured numbers are **identical to the `m1_cost=10` row of
+the spike's M1-as-pin-access experiment**. Per-net topology inspection
+confirms the kernel is doing the *right thing* — a pure-V Hazard3 net
+that previously ran illegal V wire on M1 now via-stacks M1 → M2(V) →
+M1 — but the aggregate TR numbers tie because for these small in-guide
+2-pin nets, "M1-cost penalty" and "per-layer preferred direction"
+produce identical routing topology.
+
+The hypothesis is falsified: preferred direction does not, by itself,
+close the residual 20% via gap or the wire-ratio drift. The remaining
+gap is now attributable to the other two unmodelled constraints flagged
+in the spike doc: **per-via-pair cost asymmetry** (gf180mcuD's M1-M2
+via differs from M3-M4 via in resistance and DRC) and **multi-pin
+Steiner topology** (our route_nets_3d is point-to-point; ~11K of 24K
+Hazard3 nets have 3+ pins, and TritonRoute's tree routing adds via
+hops that our 2-pin sample doesn't see). See
+[`plans/phase3-detailed-routing.md`](plans/phase3-detailed-routing.md)
+deliverables 2 and 3.
+
+## What this slice did buy
+
+- The kernel API is now factored at the right layer: `(w, w_v)` is
+  the general form. Option B (free per-cell anisotropy) and option A
+  (factored from per-layer multipliers via `axis_costs`) use the same
+  kernel.
+- Per-net topology is now correct under preferred-direction: routes
+  on M1-pref layers stay horizontal, V wire migrates to M2 via the
+  via stack. This is a precondition for any further-realistic
+  comparison.
+- The remaining unmodelled constraints (per-via-pair, multi-pin) are
+  now the only items left in WS3.2.

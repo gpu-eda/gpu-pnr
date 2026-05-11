@@ -54,11 +54,13 @@ Implemented per [ADR 0006](../adr/0006-sequential-via-relax.md).
 
 ### WS3.2 — Real-fixture integration (Hazard3 on gf180mcuD)
 
-**Status:** Spike complete; preferred-direction is the next slice.
+**Status:** Preferred-direction shipped (2026-05-11, commit `eee87bf`,
+[ADR 0010](../adr/0010-per-axis-cost-tensors.md)); multi-pin nets and
+per-via-pair `via_cost` remain.
 
 Spike outcomes captured in
 [`../spikes/phase32-hazard3-real-fixture.md`](../spikes/phase32-hazard3-real-fixture.md).
-Headline measurements after the M1-cost experiment:
+Headline measurements after preferred-direction (commit `eee87bf`):
 
 | Sample | wire ratio vs TR | via ratio vs TR |
 |--------|------------------|-----------------|
@@ -66,35 +68,34 @@ Headline measurements after the M1-cost experiment:
 | 200    | 1.26×            | 0.78×           |
 | 500    | 1.36×            | 0.80×           |
 
-The via ratio is now stable across sample sizes; the residual 20% via gap and
-the sample-size-dependent wire-ratio drift (1.08× → 1.36×) are both
-consistent with unmodelled per-layer preferred direction.
+Numbers tie with the spike's `m1_cost=10` row exactly; preferred-direction
+is a kernel-correct generalisation of the M1-cost knob but does not close
+the residual gap on its own. The residual ~20% via gap and the 1.08× →
+1.36× wire-ratio drift are now attributable to per-via-pair cost
+asymmetry (deliverable 3) and multi-pin Steiner topology (deliverable 2);
+see the spike doc's "Preferred-direction experiment" amendment.
 
 **WS3.2 deliverables (priority order):**
 
-1. **Per-layer preferred direction.** gf180mcuD's M1 is horizontal-preferred,
-   M2 vertical, M3 horizontal, etc. Two design candidates:
-   - **(A) Per-axis cost multiplier per layer** — `axis_mults[l] = (h_mult,
-     v_mult)`. The kernel already supports different `w` per axis through
-     `_precompute_axis`; we just build `w_h = w * h_mult[l]` and
-     `w_v = w * v_mult[l]` and pass them separately. Simplest kernel surgery.
-   - **(B) Per-edge `w_h[l,r,c]` and `w_v[l,r,c]`** — fully general per-cell
-     anisotropy. Same kernel surgery as (A), just no factor-of-`mult[l]`
-     structure on the input tensors.
-   - Both candidates leave the scan trick intact. Decision deferred until we
-     start (A) and see if anything in the per-cell case demands more
-     flexibility.
+1. **Per-layer preferred direction.** Shipped 2026-05-11, commit `eee87bf`,
+   [ADR 0010](../adr/0010-per-axis-cost-tensors.md). The kernel now takes
+   `(w, w_v)` with `axis_costs(w, h_mult, v_mult)` as the option-A builder
+   on top of the general option-B surface.
 2. **Multi-pin nets.** ~11K of 24K Hazard3 nets have 3+ pins; spike was 2-pin
    only. Sequential point-to-point with re-rooting, or a Steiner-tree-flavored
-   heuristic.
+   heuristic. **Promoted to next:** the preferred-direction experiment ruled
+   itself out as the cause of the residual gap, so this is now load-bearing.
 3. **Per-via-pair `via_cost`.** Replace the scalar with a length-`(L-1)` array.
-   Tiny API change; finishes the realism story.
+   Tiny API change; finishes the realism story. Defer until (2) lands so the
+   TR-comparison deltas are interpretable.
 
 **Exit criteria for WS3.2:**
 
-- [ ] Preferred-direction landed; via ratio vs TR closes from ~0.78× toward
+- [x] Preferred-direction landed; via ratio vs TR closes from ~0.78× toward
       ~1.0×, wire ratio stabilises across sample sizes (no longer drifts
       1.08× → 1.36×).
+      *Landed but did not close the gap — numbers tie with `m1_cost=10`.
+      Hypothesis falsified, gap re-attributed to deliverables 2 and 3.*
 - [ ] Multi-pin nets supported by `route_nets_3d`; at least 80% of Hazard3's
       multi-pin nets route end-to-end.
 - [ ] Per-via-pair `via_cost` plumbed through; TR comparison re-run with
