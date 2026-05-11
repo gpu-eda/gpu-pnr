@@ -51,10 +51,23 @@ from gpu_pnr.sweep import axis_costs
 PREFERRED_DIRECTION = ["H", "V", "H", "V", "H"]
 
 
-def _preferred_direction_multipliers(off_mult: float) -> tuple[list[float], list[float]]:
-    """Return (h_mult, v_mult) for gf180mcuD's M1=H, M2=V, ... alternation."""
+def _preferred_direction_multipliers(
+    off_mult: float, m1_penalty: float = 1.0
+) -> tuple[list[float], list[float]]:
+    """Return (h_mult, v_mult) for gf180mcuD's M1=H, M2=V, ... alternation.
+
+    When `m1_penalty` > 1.0, M1 is treated as pin-access-only: both H and
+    V on M1 are made expensive (h_mult[0] = v_mult[0] = m1_penalty),
+    overriding the preferred-direction off_mult assignment for that
+    layer. Real gf180mcuD DR forbids M1 wire entirely; the
+    preferred-direction model alone leaves M1-H cheap which the router
+    happily exploits, so this knob recovers TR's pin-only convention.
+    """
     h = [1.0 if d == "H" else off_mult for d in PREFERRED_DIRECTION]
     v = [1.0 if d == "V" else off_mult for d in PREFERRED_DIRECTION]
+    if m1_penalty != 1.0:
+        h[0] = m1_penalty
+        v[0] = m1_penalty
     return h, v
 
 
@@ -165,7 +178,31 @@ def _sample_two_pin(n: int) -> list[tuple[str, list]]:
     return two_pin[:n]
 
 
-def render_chip(n: int, scale: int, out_dir: Path, off_mult: float) -> None:
+def _apply_m1_pin_only(w: torch.Tensor, pins: list[tuple[int, int, int]]) -> None:
+    """In-place: mark all M1 cells as obstacles, then carve a 1-cell-radius
+    landing pad around each pin coord. Forces wire body onto M2+ regardless
+    of cost balance -- the strictest approximation of gf180mcuD's no-M1-wire
+    DRC convention. Pin reservation in route_nets_3d still works because
+    it operates on specific coords (which we restore here as finite).
+    """
+    H, W = w.shape[1], w.shape[2]
+    w[0] = float("inf")
+    for pl, pr, pc in pins:
+        if pl != 0:
+            continue
+        rlo, rhi = max(0, pr - 1), min(H, pr + 2)
+        clo, chi = max(0, pc - 1), min(W, pc + 2)
+        w[0, rlo:rhi, clo:chi] = 1.0
+
+
+def render_chip(
+    n: int,
+    scale: int,
+    out_dir: Path,
+    off_mult: float,
+    m1_penalty: float,
+    m1_pin_only: bool,
+) -> None:
     """Chip-scale per-layer overlay over the N smallest two-pin nets."""
     xlo, ylo, xhi, yhi = parse_def_diearea(FINAL_DEF)
     H_chip = (yhi - ylo) // PITCH_DBU + 1
@@ -182,9 +219,13 @@ def render_chip(n: int, scale: int, out_dir: Path, off_mult: float) -> None:
 
     h_mult: list[float] | None
     v_mult: list[float] | None
-    if off_mult != 1.0:
-        h_mult, v_mult = _preferred_direction_multipliers(off_mult)
-        print(f"  off_mult={off_mult}; h_mult={h_mult}; v_mult={v_mult}")
+    if m1_pin_only:
+        m1_penalty = 1.0  # superseded by the pin-only mask
+        print("  M1 mode: pin-cell only (non-pin M1 cells set to inf)")
+    if off_mult != 1.0 or m1_penalty != 1.0:
+        h_mult, v_mult = _preferred_direction_multipliers(off_mult, m1_penalty)
+        print(f"  off_mult={off_mult}; m1_penalty={m1_penalty};")
+        print(f"  h_mult={h_mult}; v_mult={v_mult}")
     else:
         h_mult = v_mult = None
 
@@ -193,13 +234,15 @@ def render_chip(n: int, scale: int, out_dir: Path, off_mult: float) -> None:
     for net_name, rects in sample:
         try:
             w, origin = build_grid(rects)
+            m1 = [r for r in rects if r[4] == "Metal1"]
+            src = rect_center_to_grid(m1[0], origin)
+            snk = rect_center_to_grid(m1[1], origin)
+            if m1_pin_only:
+                _apply_m1_pin_only(w, [src, snk])
             if h_mult is not None and v_mult is not None:
                 w_h, w_v = axis_costs(w, h_mult, v_mult)
             else:
                 w_h, w_v = w, None
-            m1 = [r for r in rects if r[4] == "Metal1"]
-            src = rect_center_to_grid(m1[0], origin)
-            snk = rect_center_to_grid(m1[1], origin)
         except (ValueError, IndexError):
             continue
         res = route_nets_3d(w_h, [(src, snk)], via_cost=5.0, w_v=w_v)
@@ -258,7 +301,13 @@ def render_chip(n: int, scale: int, out_dir: Path, off_mult: float) -> None:
         print(f"  wrote {out_path}")
 
 
-def render_net(net_name: str, out_dir: Path, off_mult: float) -> None:
+def render_net(
+    net_name: str,
+    out_dir: Path,
+    off_mult: float,
+    m1_penalty: float,
+    m1_pin_only: bool,
+) -> None:
     """Single-net per-layer overlay on the net's own bbox."""
     all_nets = parse_guides(GUIDE)
     if net_name not in all_nets:
@@ -268,23 +317,26 @@ def render_net(net_name: str, out_dir: Path, off_mult: float) -> None:
     L, H, W = w.shape
     print(f"net {net_name}: per-net grid {L}x{H}x{W}; origin={origin}")
 
-    h_mult: list[float] | None
-    v_mult: list[float] | None
-    if off_mult != 1.0:
-        h_mult, v_mult = _preferred_direction_multipliers(off_mult)
-    else:
-        h_mult = v_mult = None
-    if h_mult is not None and v_mult is not None:
-        w_h, w_v = axis_costs(w, h_mult, v_mult)
-    else:
-        w_h, w_v = w, None
-
     m1 = [r for r in rects if r[4] == "Metal1"]
     if len(m1) < 2:
         raise SystemExit(f"net {net_name} has fewer than 2 Metal1 pins; net mode "
                          f"currently expects 2-pin nets")
     src = rect_center_to_grid(m1[0], origin)
     snk = rect_center_to_grid(m1[1], origin)
+    if m1_pin_only:
+        _apply_m1_pin_only(w, [src, snk])
+        m1_penalty = 1.0
+
+    h_mult: list[float] | None
+    v_mult: list[float] | None
+    if off_mult != 1.0 or m1_penalty != 1.0:
+        h_mult, v_mult = _preferred_direction_multipliers(off_mult, m1_penalty)
+    else:
+        h_mult = v_mult = None
+    if h_mult is not None and v_mult is not None:
+        w_h, w_v = axis_costs(w, h_mult, v_mult)
+    else:
+        w_h, w_v = w, None
     res = route_nets_3d(w_h, [(src, snk)], via_cost=5.0, w_v=w_v)
     path = res[0].path
 
@@ -351,15 +403,28 @@ def main() -> None:
     p.add_argument("--out", type=Path, default=Path("viz_output"))
     p.add_argument("--off-mult", type=float, default=10.0,
                    help="preferred-direction off-axis multiplier; 1.0 = isotropic")
+    p.add_argument("--m1-penalty", type=float, default=1.0,
+                   help="multiplier on BOTH axes of M1 wire cost; 1.0 = no "
+                        "extra penalty; >1.0 approximates gf180mcuD's "
+                        "pin-access-only convention for M1")
+    p.add_argument("--m1-pin-only", action="store_true",
+                   help="strict: M1 cells become inf except the pin coords + "
+                        "1-cell-radius landing pad. Overrides --m1-penalty. "
+                        "Mimics DRC: no M1 wire allowed")
     args = p.parse_args()
 
     if args.mode == "chip":
-        render_chip(args.n, args.scale, args.out, args.off_mult)
+        render_chip(
+            args.n, args.scale, args.out, args.off_mult, args.m1_penalty,
+            args.m1_pin_only,
+        )
     else:
         if args.net is None:
             print("--net NAME is required for --mode net", file=sys.stderr)
             sys.exit(2)
-        render_net(args.net, args.out, args.off_mult)
+        render_net(
+            args.net, args.out, args.off_mult, args.m1_penalty, args.m1_pin_only,
+        )
 
 
 if __name__ == "__main__":
