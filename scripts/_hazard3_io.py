@@ -99,6 +99,98 @@ def rect_center_to_grid(
 
 _COORD_RE = re.compile(r"\(\s*(-?\d+|\*)\s+(-?\d+|\*)\s*\)")
 _NET_HEADER_RE = re.compile(r"^\s*-\s+(\S+)\s")
+_DIEAREA_RE = re.compile(
+    r"DIEAREA\s+\(\s*(-?\d+)\s+(-?\d+)\s*\)\s+\(\s*(-?\d+)\s+(-?\d+)\s*\)"
+)
+
+
+def parse_def_diearea(def_path: Path) -> tuple[int, int, int, int]:
+    """Parse the DIEAREA line; returns (xlo, ylo, xhi, yhi) in DEF DBU."""
+    m = _DIEAREA_RE.search(def_path.read_text())
+    if m is None:
+        raise ValueError(f"DIEAREA not found in {def_path}")
+    return int(m.group(1)), int(m.group(2)), int(m.group(3)), int(m.group(4))
+
+
+# Wire segment: (layer_name, x0, y0, x1, y1) -- endpoints in DEF DBU.
+DefSegment = tuple[str, int, int, int, int]
+# Via point: (layer_name_anchor, x, y, via_name).
+DefVia = tuple[str, int, int, str]
+
+
+def parse_def_net_geometry(
+    def_path: Path,
+) -> dict[str, tuple[list[DefSegment], list[DefVia]]]:
+    """Parse the NETS section for per-segment geometry.
+
+    Returns {net_name: (wire_segments, vias)}. Same DEF semantics as
+    `parse_def_nets`: `*` resolves against `last_x`/`last_y`, RECT
+    annotations are pin shapes (ignored). The via name (e.g. Via1_HV)
+    implies the two layers it connects, but we don't decode that here --
+    we just store the anchor coordinate and the via name; the renderer
+    can paint a marker on the anchor layer if it wants to.
+    """
+    text = def_path.read_text()
+    nets_start = text.find("\nNETS ")
+    nets_end = text.find("\nEND NETS")
+    if nets_start < 0 or nets_end < 0:
+        raise ValueError(f"NETS section not found in {def_path}")
+    section = text[nets_start:nets_end]
+
+    nets: dict[str, tuple[list[DefSegment], list[DefVia]]] = {}
+    cur_name: str | None = None
+    cur_segments: list[DefSegment] = []
+    cur_vias: list[DefVia] = []
+    cur_layer: str | None = None
+    last_x = 0
+    last_y = 0
+
+    for line in section.splitlines():
+        m = _NET_HEADER_RE.match(line)
+        if m is not None:
+            if cur_name is not None:
+                nets[cur_name] = (cur_segments, cur_vias)
+            cur_name = m.group(1)
+            cur_segments = []
+            cur_vias = []
+            cur_layer = None
+            last_x = 0
+            last_y = 0
+            continue
+        if cur_name is None:
+            continue
+        # Lines that introduce a routing layer carry a "Metal<n>" token
+        # (after "+ ROUTED" or "NEW"). Lift it into cur_layer; subsequent
+        # "*"-coord lines on the same net stay on that layer until a new
+        # Metal token appears.
+        for tok in line.split():
+            if tok.startswith("Metal"):
+                cur_layer = tok
+                break
+        coords = _COORD_RE.findall(line)
+        if not coords:
+            continue
+        x0_tok, y0_tok = coords[0]
+        x0 = last_x if x0_tok == "*" else int(x0_tok)
+        y0 = last_y if y0_tok == "*" else int(y0_tok)
+        last_x, last_y = x0, y0
+        if "RECT" in line:
+            continue
+        if len(coords) >= 2:
+            x1_tok, y1_tok = coords[1]
+            x1 = x0 if x1_tok == "*" else int(x1_tok)
+            y1 = y0 if y1_tok == "*" else int(y1_tok)
+            if cur_layer is not None:
+                cur_segments.append((cur_layer, x0, y0, x1, y1))
+            last_x, last_y = x1, y1
+        else:
+            tokens = line.rstrip(" ;").split()
+            if tokens and tokens[-1].startswith("Via") and cur_layer is not None:
+                cur_vias.append((cur_layer, x0, y0, tokens[-1]))
+
+    if cur_name is not None:
+        nets[cur_name] = (cur_segments, cur_vias)
+    return nets
 
 
 def parse_def_nets(def_path: Path) -> dict[str, tuple[int, int]]:
