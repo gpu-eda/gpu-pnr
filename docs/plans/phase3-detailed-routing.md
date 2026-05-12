@@ -132,11 +132,23 @@ so closing the M4/M5 gap needs a different lever.
    for the via ratio. 100% routing success on the smallest 500 nets
    exceeds the 80% exit criterion.
 
-5. **Per-via-pair `via_cost`.** *Next.* Replace the scalar with a
+5. **Per-via-pair `via_cost`.** Replace the scalar with a
    length-`(L-1)` array. Targets both the M4/M5 gap from earlier work
    and the 0.60× via ratio from the multi-pin spike. With per-pair
    costs reflecting gf180mcuD's Via1/Via2/Via3/Via4 resistance and DRC
    asymmetry, the router should pick a topology closer to TR's.
+
+6. **Tier A: sweep-sharing throughput validation.** Shipped
+   2026-05-12, commit `e5dd5be`. Built `sweep_sssp_3d_multi` (3D
+   K-source SSSP) and benched it against K sequential
+   `sweep_sssp_3d` calls. **At 3D 256² × 5 layers, K=100 gives 4.05×
+   speedup** (125 → 31 ms per source). 512² peaks at 1.5× and breaks
+   at K=100. 1024² is sequential-bandwidth-bound. Confirms ADR 0008's
+   2D sweet spot extends to 3D and lets us commit to WS3.3 with
+   empirical justification. Spike doc:
+   [`../spikes/tier-a-sweep-sharing-throughput.md`](../spikes/tier-a-sweep-sharing-throughput.md).
+   Numbers folded into [`../results.md`](../results.md) Phase 3.2
+   sweep-sharing section.
 
 **Soft-guide note (not promoted to a deliverable).** The chip-scale
 visualization revealed that ~6,000 small nets are guide-locked to M1+M2
@@ -144,6 +156,12 @@ visualization revealed that ~6,000 small nets are guide-locked to M1+M2
 off-guide cells are `inf`. The natural fix is **chip-scale routing
 (WS3.3)** which drops per-net mini-grids entirely; making guides a soft
 preference instead is an interim hack we'd throw away. Skip it.
+
+**Next slice (still WS3.2): per-via-pair `via_cost` (deliverable 5)**
+— smaller scope than tile decomposition and addresses the 0.60× via
+ratio gap from the multi-pin spike. Should land before WS3.3 so the
+chip-scale comparison has both the kernel-amortization and the
+per-via-pair cost-model refinement in place.
 
 **Exit criteria for WS3.2:**
 
@@ -161,16 +179,19 @@ preference instead is an interim hack we'd throw away. Skip it.
 
 ### WS3.3 — Tile decomposition
 
-**Status:** Not started. Gated on WS3.2 deliverables 3 and 4 landing
-(M1-as-PDK-rule encoding + multi-pin nets).
+**Status:** Not started; **architecturally validated** (Tier A
+sweep-sharing bench, commit `e5dd5be`). Gated on WS3.2 deliverable 5
+(per-via-pair via_cost) landing first.
 
 Splits a too-big grid (e.g., chip-scale) into overlapping tiles, routes within
 each, reconciles at halos. Unlocks **three** things:
 
 1. Whole-chip integration (cells beyond the float32 precision wall — see
    [ADR 0005](../adr/0005-mask-based-segmented-scan.md) walk-back).
-2. The multi-source kernel's 3.10× regime per tile, enabling
-   [`route_nets_batched`](../adr/0008-defer-route-nets-batched.md) on top.
+2. The multi-source kernel's 4.05× regime per 3D 256² tile (now
+   empirically measured for the 3D kernel —
+   [`../spikes/tier-a-sweep-sharing-throughput.md`](../spikes/tier-a-sweep-sharing-throughput.md)),
+   enabling [`route_nets_batched`](../adr/0008-defer-route-nets-batched.md) on top.
 3. **Naturally subsumes "guide as soft preference"** — once we route on a
    single global cost tensor instead of per-net mini-grids, GR allocation
    becomes advisory because every cell already exists in the grid. Closes
@@ -180,11 +201,18 @@ each, reconciles at halos. Unlocks **three** things:
 
 Design choices to make when this starts:
 
-- Tile size (256² is the sweet spot for the multi-source kernel; the natural
-  default).
-- Halo width (must exceed the longest in-tile detour; data-dependent).
-- Halo reconciliation strategy: re-sweep within halos with both tiles'
+- **Tile size:** 256² × L=5 confirmed empirically as the throughput sweet
+  spot in 3D (Tier A). 512²+ tiles regress catastrophically at K=100 due
+  to MPS memory pressure on the multi-source distance tensor. **Lock 256²
+  for MPS targets; CUDA can reconsider larger tiles when implemented.**
+- **K-batch size:** 100 sources per multi-source call gives peak (4.05×)
+  throughput at 256². K=25-100 is the productive range; below K=10 the
+  GPU is launch-bound.
+- **Halo width:** must exceed the longest in-tile detour; data-dependent.
+- **Halo reconciliation strategy:** re-sweep within halos with both tiles'
   committed routes visible, or run a global second pass on a coarsened grid.
+  *Cost model unknown until measured; the bull-case wafer.space wall-clock
+  in results.md assumes halo work doesn't dominate.*
 
 **Exit criteria for WS3.3:**
 

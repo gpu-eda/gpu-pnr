@@ -505,3 +505,85 @@ limiter, not the cost model.
 - Multi-pin nets cost ~3× the per-net time of 2-pin nets because
   each tree-attachment edge runs its own SSSP. For an N-pin net the
   total work is N-1 sweeps.
+
+# Phase 3.2 — sweep-sharing throughput (Tier A)
+
+Before committing to WS3.3 (tile decomposition / chip-scale routing),
+we needed to verify the architectural premise: that multi-source SSSP
+(`sweep_sssp_3d_multi`, commit `e5dd5be`) actually amortises compute
+across K sources at chip-scale-relevant tile sizes. ADR 0008's earlier
+2D measurement said it did, at 256²; the question was whether the 3D
+kernel preserves that scaling. See
+[`spikes/tier-a-sweep-sharing-throughput.md`](spikes/tier-a-sweep-sharing-throughput.md).
+
+## 2D sweep-sharing refresh (peak speedup vs K sequential calls)
+
+| Tile size | K=1 | K=10 | K=25 | K=50 | K=100 | K=200 |
+|---|---|---|---|---|---|---|
+| 256² | 1.5× | 2.1× | 5.6× | 4.0× | **8.9×** | **9.1×** |
+| 512² | 1.2× | 1.0× | 2.9× | 2.8× | 2.2× | 2.3× |
+| 1024² | 1.5× | 1.2× | 1.0× | 0.9× | 0.8× | 0.8× |
+
+ADR 0008's pattern is confirmed and the 256² peak is now even higher
+than originally measured (9× vs the prior 3.1×). MPS perf has improved.
+
+## 3D sweep-sharing (the regime tile decomposition will actually use)
+
+3D 256² × 5 layers, via_cost=5.0:
+
+| K | seq ms | multi ms | speedup | ms/source seq | ms/source multi |
+|---|---|---|---|---|---|
+| 1 | 225 | 315 | 0.72× | 225 | 315 |
+| 10 | 641 | 313 | 2.05× | 64 | 31 |
+| 25 | 2,079 | 531 | 3.92× | 83 | 21 |
+| 50 | 4,227 | 1,264 | 3.35× | 85 | 25 |
+| **100** | **12,542** | **3,101** | **4.05×** | 125 | **31** |
+
+3D 512² × 5 layers: peaks at 1.5× at K=10-25, then **collapses to
+0.19× at K=100** as MPS hits memory-pressure on the
+(K, L, H, W) = (100, 5, 512, 512) × float32 = 524 MB distance tensor.
+
+3D 1024² × 5 layers: timed out at 7+ minutes on the K=1 case (a single
+SSSP run at this size is already memory-bandwidth-bound; sweep-sharing
+won't help).
+
+## Implications for wafer.space-scale routing
+
+- 256² × L=5 tiles are the throughput sweet spot.
+  ~5,000 tiles cover wafer.space (15K × 21K cells).
+- At 31 ms/source via K=100 batching, per-tile throughput is **100
+  nets in ~3 s**.
+- Conservative whole-chip estimate on MPS:
+  4,980 tiles × 0.5 s (K=20 avg) = **~40 min** for routing the
+  signal nets at wafer.space scale.
+- TR baseline estimate at wafer.space scale: ~1-3 hours.
+- CUDA scale-up (5-15× memory bandwidth): **~3-8 min** total on
+  modern data-center GPUs. The bull case.
+
+The numbers do not yet account for halo reconciliation, rip-up, or
+DRC iteration — those will erode the gap. But the *primary mechanism*
+(GPU SSSP amortising across many sources within a tile) is now
+empirically verified to deliver the predicted scaling.
+
+## Tile-size choice
+
+256² × L=5 is the architectural target for Phase 3.3. The 512² result
+in 3D specifically warns against picking larger tiles: the K=100
+multi-source kernel regresses by ~5× at 512² and is dramatically
+slower than the 256² version even per-source. The win comes from
+*many small tiles in parallel*, not from *fewer larger tiles*.
+
+## Caveats
+
+- The wafer.space numbers above are extrapolated, not measured. A
+  validation routing run on a real wafer.space LibreLane fixture is
+  the next obvious experiment.
+- Tile decomposition halo handling is not yet designed; reconciliation
+  costs at tile boundaries could eat a meaningful fraction of the
+  gain.
+- TR's rip-up-and-reroute iteration is unaccounted for; if we need
+  similar iteration for quality, total wall-clock grows linearly with
+  iteration count.
+- The 0.19× collapse at 3D 512² K=100 is MPS-specific — CUDA's larger
+  memory bandwidth and explicit memory management would likely make
+  that regime productive too, widening the architectural flexibility.
