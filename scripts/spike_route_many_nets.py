@@ -85,13 +85,19 @@ def main() -> None:
 
     print(f"Loading guides from {GUIDE.name}...")
     all_nets = parse_guides(GUIDE)
-    pin_count_target = ">=3 (multi-pin)" if multipin else "exactly 2 (point-to-point)"
+    # In multi-pin mode the upper bound is enforced to skip clock /
+    # power-distribution nets whose guide bboxes (and 100+ pins) make
+    # each sweep prohibitively slow on a per-net mini-grid; those nets
+    # need a different routing strategy and are deferred.
+    max_pins_multipin = 20
     if multipin:
+        pin_count_target = f"3..{max_pins_multipin} (multi-pin)"
         candidates = [
             (name, rects) for name, rects in all_nets.items()
-            if sum(1 for r in rects if r[4] == "Metal1") >= 3
+            if 3 <= sum(1 for r in rects if r[4] == "Metal1") <= max_pins_multipin
         ]
     else:
+        pin_count_target = "exactly 2 (point-to-point)"
         candidates = [
             (name, rects) for name, rects in all_nets.items()
             if sum(1 for r in rects if r[4] == "Metal1") == 2
@@ -122,7 +128,18 @@ def main() -> None:
     triton_total_vias = 0
     triton_missing = 0
 
-    for net_name, rects in sample:
+    progress_every = 100 if len(sample) >= 500 else max(1, len(sample) // 10)
+    batch_start = time.perf_counter()
+
+    for i, (net_name, rects) in enumerate(sample):
+        if i > 0 and i % progress_every == 0:
+            elapsed = time.perf_counter() - batch_start
+            print(
+                f"  [{i}/{len(sample)}] routed={total_routed} "
+                f"failed={len(failures)} elapsed={elapsed:.1f}s "
+                f"avg={1000*elapsed/i:.0f}ms/net",
+                flush=True,
+            )
         # Pre-routing setup can fail on malformed guides; the router itself
         # shouldn't ever raise for routable inputs (a None path is the
         # expected "failed" signal), so we deliberately don't wrap the
@@ -144,7 +161,7 @@ def main() -> None:
         t0 = time.perf_counter()
         if multipin:
             mp_res = route_multipin_nets_3d(
-                w_h, [pins], via_cost=via_cost, w_v=w_v
+                w_h, [pins], via_cost=via_cost, w_v=w_v, net_timeout_s=60.0,
             )[0]
             t1 = time.perf_counter()
             total_time_ms += (t1 - t0) * 1000

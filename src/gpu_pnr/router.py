@@ -16,6 +16,7 @@ different layers at the same (row, col) are distinct cells.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 
 import torch
@@ -243,6 +244,7 @@ def route_multipin_nets_3d(
     via_cost: float = 1.0,
     reserve_pins: bool = True,
     w_v: torch.Tensor | None = None,
+    net_timeout_s: float | None = None,
 ) -> list[MultiPin3DResult]:
     """Route N-pin nets sequentially via incremental tree growth.
 
@@ -264,6 +266,14 @@ def route_multipin_nets_3d(
 
     For a 2-pin net this collapses to the same behaviour as
     `route_nets_3d`, just with a slightly heavier code path.
+
+    `net_timeout_s` (optional): if a single net's routing exceeds this
+    wall-clock budget, the net is marked unrouted and the batch
+    continues. Useful for chip-scale runs where clock/power-distribution
+    nets with O(100) pins and huge guide bboxes can take minutes per
+    sweep and block progress on the rest of the workload. The check
+    happens between attachment iterations -- in-flight sweeps are not
+    interrupted.
     """
     inf_val = torch.tensor(float("inf"), device=w.device, dtype=w.dtype)
     w_cur = w.clone()
@@ -309,8 +319,14 @@ def route_multipin_nets_3d(
         unrouted: set[tuple[int, int, int]] = set(pins[1:])
         paths: list[list[tuple[int, int, int]]] = [[pins[0]]]
         failed = False
+        net_start = time.perf_counter()
 
         while unrouted and not failed:
+            if net_timeout_s is not None and (
+                time.perf_counter() - net_start > net_timeout_s
+            ):
+                failed = True
+                break
             seed = next(iter(tree))
             extras = tuple(c for c in tree if c != seed)
             d, _ = sweep_sssp_3d(

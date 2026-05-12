@@ -151,6 +151,9 @@ def _downsample_or_canvas(canvas: np.ndarray, scale: int) -> np.ndarray:
     return out
 
 
+MAX_PINS_MULTIPIN = 20  # skip clock/power-distribution nets
+
+
 def _sample_nets(n: int, min_pins: int, max_pins: int | None) -> list[tuple[str, list]]:
     """Sample the N smallest nets whose Metal1 pin count is in
     [min_pins, max_pins] inclusive (max_pins=None means no upper bound).
@@ -191,8 +194,11 @@ def render_chip(
     theirs = np.zeros((L, H_chip, W_chip), dtype=bool)
 
     if multipin:
-        sample = _sample_nets(n, min_pins=3, max_pins=None)
-        print(f"chip mode: MULTI-PIN ({n} smallest 3+-pin nets)")
+        sample = _sample_nets(n, min_pins=3, max_pins=MAX_PINS_MULTIPIN)
+        print(
+            f"chip mode: MULTI-PIN ({n} smallest 3..{MAX_PINS_MULTIPIN}-pin "
+            "nets; clock / power-distribution nets > 20 pins are skipped)"
+        )
     else:
         sample = _sample_nets(n, min_pins=2, max_pins=2)
         print(f"chip mode: 2-pin ({n} smallest 2-pin nets)")
@@ -218,8 +224,16 @@ def render_chip(
         h_mult = v_mult = None
 
     t0 = time.perf_counter()
-    routed = missing_in_tr = 0
-    for net_name, rects in sample:
+    routed = missing_in_tr = failed = 0
+    progress_every = 100 if len(sample) >= 500 else max(1, len(sample) // 10)
+    for i, (net_name, rects) in enumerate(sample):
+        if i > 0 and i % progress_every == 0:
+            elapsed = time.perf_counter() - t0
+            print(
+                f"  [{i}/{len(sample)}] routed={routed} failed={failed} "
+                f"elapsed={elapsed:.1f}s avg={1000*elapsed/i:.0f}ms/net",
+                flush=True,
+            )
         try:
             w, origin = build_grid(rects)
             m1 = [r for r in rects if r[4] == "Metal1"]
@@ -234,14 +248,16 @@ def render_chip(
             continue
         if multipin:
             mp_res = route_multipin_nets_3d(
-                w_h, [pins], via_cost=5.0, w_v=w_v
+                w_h, [pins], via_cost=5.0, w_v=w_v, net_timeout_s=60.0,
             )[0]
             if not mp_res.routed:
+                failed += 1
                 continue
             our_cells: list[tuple[int, int, int]] = list(mp_res.cells)
         else:
             res = route_nets_3d(w_h, [(pins[0], pins[1])], via_cost=5.0, w_v=w_v)
             if res[0].path is None:
+                failed += 1
                 continue
             our_cells = res[0].path
         routed += 1
