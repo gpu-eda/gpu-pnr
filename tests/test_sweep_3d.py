@@ -12,6 +12,7 @@ from gpu_pnr.sweep import (
     backtrace_3d,
     sweep_sssp,
     sweep_sssp_3d,
+    sweep_sssp_3d_multi,
 )
 
 
@@ -347,6 +348,46 @@ def test_extra_sources_match_min_over_dijkstra_runs():
     assert torch.allclose(
         d_multi.cpu()[finite], d_expected.cpu()[finite], atol=5e-2
     )
+
+
+def test_sweep_sssp_3d_multi_matches_per_source():
+    """K-batched 3D distance maps must equal the per-source single-source
+    runs stacked. The leading K dim is the only difference; each slice
+    is an independent SSSP."""
+    torch.manual_seed(30)
+    L, H, W = 3, 12, 12
+    w = torch.rand(L, H, W) + 0.1
+    w[1, 5, 2:10] = math.inf
+    via_cost = 0.7
+    sources = [(0, 0, 0), (2, 11, 11), (1, 3, 8), (0, 6, 4)]
+    d_multi, _ = sweep_sssp_3d_multi(w, sources, via_cost=via_cost)
+    assert d_multi.shape == (len(sources), L, H, W)
+    for k, s in enumerate(sources):
+        d_single, _ = sweep_sssp_3d(w, s, via_cost=via_cost)
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_multi[k].cpu()[finite.cpu()], d_single.cpu()[finite.cpu()],
+            atol=5e-2,
+        ), f"source {k}={s}: K-batched diverges from single-source"
+        assert torch.all(torch.isinf(d_multi[k].cpu()[~finite.cpu()]))
+
+
+def test_sweep_sssp_3d_multi_anisotropic_matches_per_source():
+    """K-batched 3D sweep with w_v anisotropy still tracks per-source runs."""
+    torch.manual_seed(31)
+    L, H, W = 3, 10, 10
+    w = torch.rand(L, H, W) + 0.1
+    w_h, w_v = axis_costs(w, [1.0, 8.0, 1.0], [8.0, 1.0, 8.0])
+    via_cost = 0.5
+    sources = [(0, 0, 0), (2, 9, 9), (1, 4, 4)]
+    d_multi, _ = sweep_sssp_3d_multi(w_h, sources, via_cost=via_cost, w_v=w_v)
+    for k, s in enumerate(sources):
+        d_single, _ = sweep_sssp_3d(w_h, s, via_cost=via_cost, w_v=w_v)
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_multi[k].cpu()[finite.cpu()], d_single.cpu()[finite.cpu()],
+            atol=5e-2,
+        ), f"source {k}={s}: anisotropic K-batched diverges from single-source"
 
 
 def test_backtrace_extra_sources_terminates_at_any_seed():

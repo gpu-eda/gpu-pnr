@@ -1,8 +1,10 @@
-"""Compare K sequential sweep_sssp() calls vs one sweep_sssp_multi(K).
+"""Compare K sequential SSSP calls vs one K-batched multi-source SSSP.
 
 Same grid, same K random source positions. Reports wall-clock for each
 and the speedup. Demonstrates the GPU throughput potential of
-sweep-sharing.
+sweep-sharing. Supports both 2D (sweep_sssp_multi) and 3D
+(sweep_sssp_3d_multi) modes; the 3D mode is the one Phase 3.3 tile
+decomposition will use.
 """
 
 from __future__ import annotations
@@ -13,7 +15,19 @@ import time
 
 import torch
 
-from gpu_pnr.sweep import sweep_sssp, sweep_sssp_multi
+from gpu_pnr.sweep import (
+    sweep_sssp,
+    sweep_sssp_3d,
+    sweep_sssp_3d_multi,
+    sweep_sssp_multi,
+)
+
+
+def _sync(device: str) -> None:
+    if device == "mps":
+        torch.mps.synchronize()
+    elif device == "cuda":
+        torch.cuda.synchronize()
 
 
 def main() -> None:
@@ -22,6 +36,18 @@ def main() -> None:
     p.add_argument("--ks", type=int, nargs="+", default=[1, 5, 10, 25, 50])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", type=str, default="auto")
+    p.add_argument(
+        "--mode", choices=("2d", "3d"), default="2d",
+        help="2d: sweep_sssp_multi; 3d: sweep_sssp_3d_multi at L layers"
+    )
+    p.add_argument(
+        "--layers", type=int, default=5,
+        help="number of metal layers for 3d mode (gf180mcuD = 5)"
+    )
+    p.add_argument(
+        "--via-cost", type=float, default=5.0,
+        help="via cost for 3d mode"
+    )
     args = p.parse_args()
 
     if args.device == "auto":
@@ -29,21 +55,45 @@ def main() -> None:
     else:
         device = args.device
 
-    print(f"Grid: {args.size}x{args.size}  device={device}")
+    if args.mode == "3d":
+        print(
+            f"3D grid: {args.layers} layers x {args.size}x{args.size}  "
+            f"via_cost={args.via_cost}  device={device}"
+        )
+    else:
+        print(f"2D grid: {args.size}x{args.size}  device={device}")
     print()
 
-    w_warm = torch.ones(64, 64, device=device)
-    _ = sweep_sssp(w_warm, (0, 0))
-    _ = sweep_sssp_multi(w_warm, [(0, 0), (10, 10)])
-    if device == "mps":
-        torch.mps.synchronize()
+    # Warm-up.
+    if args.mode == "3d":
+        w_warm = torch.ones(args.layers, 64, 64, device=device)
+        _ = sweep_sssp_3d(w_warm, (0, 0, 0), via_cost=args.via_cost)
+        _ = sweep_sssp_3d_multi(
+            w_warm, [(0, 0, 0), (0, 10, 10)], via_cost=args.via_cost
+        )
+    else:
+        w_warm = torch.ones(64, 64, device=device)
+        _ = sweep_sssp(w_warm, (0, 0))
+        _ = sweep_sssp_multi(w_warm, [(0, 0), (10, 10)])
+    _sync(device)
 
-    w = torch.ones(args.size, args.size, device=device)
     rng = random.Random(args.seed)
-    all_sources = [
-        (rng.randrange(args.size), rng.randrange(args.size))
-        for _ in range(max(args.ks))
-    ]
+    if args.mode == "3d":
+        w = torch.ones(args.layers, args.size, args.size, device=device)
+        all_sources = [
+            (
+                rng.randrange(args.layers),
+                rng.randrange(args.size),
+                rng.randrange(args.size),
+            )
+            for _ in range(max(args.ks))
+        ]
+    else:
+        w = torch.ones(args.size, args.size, device=device)
+        all_sources = [
+            (rng.randrange(args.size), rng.randrange(args.size))
+            for _ in range(max(args.ks))
+        ]
 
     print(
         f"{'K':>4}  {'sequential_ms':>14}  {'multi_ms':>10}  "
@@ -53,21 +103,24 @@ def main() -> None:
     for K in args.ks:
         sources = all_sources[:K]
 
-        if device == "mps":
-            torch.mps.synchronize()
+        _sync(device)
         t0 = time.perf_counter()
-        for src in sources:
-            _ = sweep_sssp(w, src)
-        if device == "mps":
-            torch.mps.synchronize()
+        if args.mode == "3d":
+            for src in sources:
+                _ = sweep_sssp_3d(w, src, via_cost=args.via_cost)
+        else:
+            for src in sources:
+                _ = sweep_sssp(w, src)
+        _sync(device)
         t_seq = (time.perf_counter() - t0) * 1000.0
 
-        if device == "mps":
-            torch.mps.synchronize()
+        _sync(device)
         t0 = time.perf_counter()
-        _ = sweep_sssp_multi(w, sources)
-        if device == "mps":
-            torch.mps.synchronize()
+        if args.mode == "3d":
+            _ = sweep_sssp_3d_multi(w, sources, via_cost=args.via_cost)
+        else:
+            _ = sweep_sssp_multi(w, sources)
+        _sync(device)
         t_mul = (time.perf_counter() - t0) * 1000.0
 
         speedup = t_seq / t_mul if t_mul > 0 else float("inf")

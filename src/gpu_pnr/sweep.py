@@ -455,6 +455,79 @@ def axis_costs(
     return w_h, w_v
 
 
+def sweep_sssp_3d_multi(
+    w: torch.Tensor,
+    sources: list[tuple[int, int, int]],
+    via_cost: float = 1.0,
+    max_iters: int = 200,
+    check_every: int = 8,
+    seg_barrier: float | None = None,
+    w_v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Compute K shortest-path distance maps on a multi-layer grid concurrently.
+
+    Generalises `sweep_sssp_3d` to a leading batch dim K, the way
+    `sweep_sssp_multi` generalises `sweep_sssp`. Sources are independent;
+    each one gets its own (L, H, W) distance map. The point is GPU
+    throughput: one fused kernel call replaces K sequential calls.
+    Intended use is per-tile batched routing once Phase 3.3's tile
+    decomposition lands -- K independent 2-pin routes within the same
+    tile can be solved in one sweep.
+
+    Args:
+        w: (L, H, W) cost tensor for axis=2 ("H") moves.
+        sources: list of K (layer, row, col) source coords.
+        via_cost, max_iters, check_every, seg_barrier, w_v: as in
+            `sweep_sssp_3d`.
+
+    Returns:
+        (d, iters) where d is (K, L, H, W).
+    """
+    K = len(sources)
+    L, H, W = w.shape
+    d = torch.full((K, L, H, W), float("inf"), device=w.device, dtype=w.dtype)
+    for k, (sl, sr, sc) in enumerate(sources):
+        d[k, sl, sr, sc] = 0.0
+    mask_h = _obstacle_mask(w)
+    if w_v is not None:
+        mask_v = _obstacle_mask(w_v)
+        mask_via = mask_h & mask_v
+    else:
+        mask_v = mask_h
+        mask_via = mask_h
+    inf_scalar = float("inf")
+    if seg_barrier is None:
+        seg_barrier = _autotune_seg_barrier(
+            w,
+            mask_h,
+            via_cost=via_cost,
+            w_v=w_v,
+            obstacle_mask_v=mask_v if w_v is not None else None,
+        )
+    w_b = w.unsqueeze(0)
+    mask_h_b = mask_h.unsqueeze(0)
+    mask_v_b = mask_v.unsqueeze(0)
+    mask_via_b = mask_via.unsqueeze(0)
+    fwd_h, bwd_h = _precompute_axis(w_b, mask_h_b, axis=3, seg_barrier=seg_barrier)
+    w_for_v = (w_v if w_v is not None else w).unsqueeze(0)
+    fwd_v, bwd_v = _precompute_axis(w_for_v, mask_v_b, axis=2, seg_barrier=seg_barrier)
+
+    def step(d: torch.Tensor) -> torch.Tensor:
+        d = _sweep_forward(d, fwd_h, axis=3)
+        d = _sweep_backward(d, bwd_h, axis=3)
+        d = _sweep_forward(d, fwd_v, axis=2)
+        d = _sweep_backward(d, bwd_v, axis=2)
+        for lyr in range(1, L):
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + via_cost)
+            d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
+        for lyr in range(L - 2, -1, -1):
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + via_cost)
+            d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
+        return d
+
+    return _converge_or_max(d, step, max_iters, check_every)
+
+
 def backtrace(
     d: torch.Tensor,
     w: torch.Tensor,
