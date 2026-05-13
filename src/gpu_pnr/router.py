@@ -17,6 +17,7 @@ different layers at the same (row, col) are distinct cells.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import torch
@@ -245,6 +246,7 @@ def route_multipin_nets_3d(
     reserve_pins: bool = True,
     w_v: torch.Tensor | None = None,
     net_timeout_s: float | None = None,
+    progress_callback: Callable[[int, MultiPin3DResult, float], None] | None = None,
 ) -> list[MultiPin3DResult]:
     """Route N-pin nets sequentially via incremental tree growth.
 
@@ -274,6 +276,12 @@ def route_multipin_nets_3d(
     sweep and block progress on the rest of the workload. The check
     happens between attachment iterations -- in-flight sweeps are not
     interrupted.
+
+    `progress_callback` (optional): called as
+    `progress_callback(net_idx, result, elapsed_s)` after each net
+    completes (whether routed or not). Useful for chip-scale runs to
+    get visibility into per-net wall-clock without having to flush
+    stdout inside the kernel.
     """
     inf_val = torch.tensor(float("inf"), device=w.device, dtype=w.dtype)
     w_cur = w.clone()
@@ -300,15 +308,25 @@ def route_multipin_nets_3d(
                 _set_inf(ijk)
 
     results: list[MultiPin3DResult] = []
-    for pins in nets:
+    for net_idx, pins in enumerate(nets):
+        net_t0 = time.perf_counter()
         if len(pins) < 2:
-            results.append(MultiPin3DResult(list(pins), None))
+            r = MultiPin3DResult(list(pins), None)
+            results.append(r)
+            if progress_callback is not None:
+                progress_callback(net_idx, r, time.perf_counter() - net_t0)
             continue
         if any(p in routed_cells for p in pins):
-            results.append(MultiPin3DResult(list(pins), None))
+            r = MultiPin3DResult(list(pins), None)
+            results.append(r)
+            if progress_callback is not None:
+                progress_callback(net_idx, r, time.perf_counter() - net_t0)
             continue
         if not all(_is_finite(w, p) for p in pins):
-            results.append(MultiPin3DResult(list(pins), None))
+            r = MultiPin3DResult(list(pins), None)
+            results.append(r)
+            if progress_callback is not None:
+                progress_callback(net_idx, r, time.perf_counter() - net_t0)
             continue
 
         if reserve_pins:
@@ -369,11 +387,14 @@ def route_multipin_nets_3d(
             if reserve_pins:
                 for p in pins:
                     _set_inf(p)
-            results.append(MultiPin3DResult(list(pins), None))
+            r = MultiPin3DResult(list(pins), None)
         else:
             for c in tree:
                 _set_inf(c)
                 routed_cells.add(c)
-            results.append(MultiPin3DResult(list(pins), paths))
+            r = MultiPin3DResult(list(pins), paths)
+        results.append(r)
+        if progress_callback is not None:
+            progress_callback(net_idx, r, time.perf_counter() - net_t0)
 
     return results
