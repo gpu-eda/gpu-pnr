@@ -1,6 +1,7 @@
 # ADR 0012 — Tile decomposition for chip-scale 3D routing
 
-**Status:** Proposed (2026-05-14).
+**Status:** Accepted (2026-05-14). Substrate validated by tile
+prototype on the same day — see "Prototype findings" below.
 
 ## Context
 
@@ -180,6 +181,38 @@ chip-scale grid** in a separate first pass.
   worst-case baseline for TR comparison. WS3.3's chip-scale router
   needs to beat that prototype's 327 s/net by a wide margin to be
   worth shipping.
+
+## Prototype findings (2026-05-14)
+
+`scripts/tile_decomp_prototype.py` (commit `26f0251`) routed the
+densest 256² × 5 tile in Hazard3 (rows [7936:8192) cols
+[2560:2816), 27 candidate nets, halo=32) on the tile-shared cost
+grid via sequential `route_multipin_nets_3d`. Headline results:
+
+- **Substrate correctness: 0 cross-net cell conflicts** on the
+  routes that ran. Tile-shared `w_cur` propagates obstacles across
+  nets exactly as designed.
+- **Routability: 6 / 27 (22%).** All 21 failures are
+  pin-collision — two distinct nets quantize to the same
+  `(layer, row, col)` cell because this prototype uses guide-rect
+  centers as pin coords on Hazard3's 200nm cell pitch.
+  `route_fail=0` confirms every net that could *legally* route did
+  route. This validates the substrate; pin-collision avoidance is
+  upstream (DEF-driven pin extraction), not a router concern.
+- **Halo occupancy: 0%.** All committed cells fell inside the inner
+  256² owned region; none reached the halo ring. Insufficient
+  data to conclude halo=32 is over-provisioned — this workload
+  was M1+M2-confined (670/694 cells on M2), so halo's natural
+  use case (M3+ long-haul detours) wasn't exercised here.
+- **Throughput: 54 ms/net.** Comparable to the per-net mini-grid
+  spike's 41–50 ms/net at 2-pin, with the added benefit of
+  cross-net obstacle awareness. The K=100 batched regime
+  (`sweep_sssp_3d_multi`) would push this toward 31 ms/source per
+  Tier A — to be measured in the full tile router.
+
+Net consequence for the design: substrate locked, halo width
+deferred (refine to 16 or 64 once a workload that actually uses
+M3+ via-stacks lands).
 
 ## Walk-back options
 
