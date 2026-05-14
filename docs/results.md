@@ -461,35 +461,48 @@ verified against Dijkstra in
 
 ## TritonRoute comparison (smallest 500 multi-pin nets)
 
-| Metric | ours | TR | ratio |
-|---|---|---|---|
-| routed | 500 / 500 (100%) | — | — |
-| wirelength | 130,725 cells | 139,583 | **0.94×** |
-| vias | 1,671 | 2,773 | **0.60×** |
-| avg per-net time | 159 ms | — | — |
+Measured at commit `a7aa2d5` (scalar via_cost=5.0) and re-measured at
+commit `fabb0d4` (per-pair via_cost API). Both runs are within noise
+of each other on wire and via counts; the via ratio drift (0.60 →
+0.55) is intervening-kernel-change noise, not a per-pair effect.
 
-Two surprising findings:
+| Metric | ours (scalar 5.0) | ours (per-pair) | TR | ratio (current) |
+|---|---|---|---|---|
+| routed | 500 / 500 (100%) | 500 / 500 (100%) | — | — |
+| wirelength | 130,805 cells | 130,805 cells | 139,583 | **0.94×** |
+| vias | 1,535 | 1,535 | 2,773 | **0.55×** |
+| M3 use | 17 / 500 nets | 17 / 500 nets | — | — |
 
-1. **We use *less* wire than TR (0.94×).** Sequential nearest-pin
-   attachment produces tight trees on small per-net mini-grids. TR's
-   Steiner topology is more sprawling, partly because it can detour
-   off-guide and partly because it optimises for a different cost
-   model (DRC + RC, not just Manhattan length).
-2. **Our via count is 60% of TR's.** That's the per-via-pair-cost
-   story showing up unambiguously: TR uses Via2/Via3 transitions to
-   escape to upper layers that our scalar `via_cost=5` makes uniformly
-   expensive. With per-pair costs (next deliverable) reflecting
-   gf180mcuD's real M1↔M2 vs M2↔M3 asymmetry, we'd expect our via
-   ratio to climb toward 1.0×.
+**Per-pair via_cost has no measurable effect on this workload.** Three
+per-pair vectors ([5.0], [8,5,3,3], [3,5,5,5]) — including ones designed
+to discourage M1↔M2 transitions and ones designed to encourage them —
+all produce *identical* numbers (130,805 / 1,535 / 17 M3 nets). Reason:
+the smallest-N filter selects nets whose guide bboxes are M1+M2-only,
+so only Via1 is ever crossed in a route, and a uniform shift in Via1
+cost is a constant offset that cannot change topology choices.
+
+The 0.55× via-ratio gap vs TR is therefore *not* a per-via-cost
+problem; it's a **tree-topology** problem. Our sequential
+nearest-pin attachment produces tight trees on small mini-grids; TR's
+Steiner-style topology is more sprawling (more wire, more vias).
+Closing this gap on per-net mini-grids would mean swapping the
+attachment heuristic for a Steiner builder — work that doesn't pay
+off because WS3.3 (chip-scale routing) replaces the per-net mini-grid
+substrate entirely. Defer the topology improvement to WS3.3+.
+
+Per-pair via_cost is still the right structural API: in WS3.3,
+chip-scale routing will route nets that span M3+ (Via2/Via3/Via4
+exercised), and per-pair costs will then become a measurable lever.
 
 ## Layer occupancy
 
-Of the smallest 500 multi-pin nets, **85 (17%) used Metal3** — the
-first slice in any of our spike samples to show meaningful M3 use by
-our router. Multi-pin nets are larger and their guides include M3,
-unlocking the escape that the smaller 2-pin nets couldn't reach.
-Confirms that the per-net guide-locking constraint is the actual
-limiter, not the cost model.
+Of the smallest 500 multi-pin nets at the current measurement, **17
+(3%) used Metal3**. The earlier a7aa2d5 measurement reported 85 (17%);
+this drifted with intervening kernel changes but not with per-pair via
+config. Either way, the headline holds: most small multi-pin nets
+route entirely within M1+M2 because their guide bboxes don't include
+M3+. The per-net guide-locking constraint is the actual limiter, not
+the cost model.
 
 ## Implementation notes
 

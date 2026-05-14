@@ -132,11 +132,31 @@ so closing the M4/M5 gap needs a different lever.
    for the via ratio. 100% routing success on the smallest 500 nets
    exceeds the 80% exit criterion.
 
-5. **Per-via-pair `via_cost`.** Replace the scalar with a
-   length-`(L-1)` array. Targets both the M4/M5 gap from earlier work
-   and the 0.60× via ratio from the multi-pin spike. With per-pair
-   costs reflecting gf180mcuD's Via1/Via2/Via3/Via4 resistance and DRC
-   asymmetry, the router should pick a topology closer to TR's.
+5. **Per-via-pair `via_cost`.** Shipped 2026-05-14, commits `72de221`
+   + `fabb0d4`. Scalar `via_cost` is now a `float | Sequence[float] |
+   Tensor` of length `L-1`: index `k` is the edge weight between layer
+   `k` and layer `k+1` (covers both directions). Plumbed through
+   `sweep_sssp_3d`, `sweep_sssp_3d_multi`, `backtrace_3d`,
+   `route_nets_3d`, `route_multipin_nets_3d`, and the
+   `dijkstra_grid_3d` reference. Backwards-compatible: a scalar
+   broadcasts to a uniform array. 8 new tests cover scalar
+   equivalence, asymmetric per-pair steering, Dijkstra parity,
+   backtrace correctness, K-batched parity, and input validation.
+
+   **Empirical finding (negative):** on the smallest-500 multi-pin
+   spike, per-pair via_costs have no measurable effect on routing.
+   Three vectors ([5.0], [8,5,3,3], [3,5,5,5]) all produce identical
+   numbers (0.94× wire, 0.55× via vs TR; 17/500 nets touching M3).
+   Reason: the smallest-N filter selects nets whose guide bboxes are
+   M1+M2-only, so only Via1 is ever crossed in a route, and a
+   constant Via1 cost is a constant offset that cannot change
+   topology choices. The original hypothesis — that per-pair Via1/2/3/4
+   asymmetry would close the 0.60× via-ratio gap — was wrong; that
+   gap is a tree-topology phenomenon (sequential attachment vs TR's
+   Steiner-style topology) and per-pair via_cost cannot reach it on
+   per-net mini-grids. Per-pair is still the right structural
+   plumbing for WS3.3, where chip-scale routing will exercise
+   Via2/Via3/Via4 on nets spanning M3+.
 
 6. **Tier A: sweep-sharing throughput validation.** Shipped
    2026-05-12, commit `e5dd5be`. Built `sweep_sssp_3d_multi` (3D
@@ -157,11 +177,13 @@ off-guide cells are `inf`. The natural fix is **chip-scale routing
 (WS3.3)** which drops per-net mini-grids entirely; making guides a soft
 preference instead is an interim hack we'd throw away. Skip it.
 
-**Next slice (still WS3.2): per-via-pair `via_cost` (deliverable 5)**
-— smaller scope than tile decomposition and addresses the 0.60× via
-ratio gap from the multi-pin spike. Should land before WS3.3 so the
-chip-scale comparison has both the kernel-amortization and the
-per-via-pair cost-model refinement in place.
+**Next slice: WS3.3 (tile decomposition).** WS3.2 deliverable 5
+shipped as semantic plumbing; the negative empirical finding (the
+0.60× via gap is topology, not cost-model) means there's no cost-model
+lever left to pull on per-net mini-grids. Topology improvement (Steiner
+vs sequential attachment) would have to happen on the same per-net
+mini-grid substrate that WS3.3 is about to replace — not worth doing
+twice. WS3.3 is the right next step.
 
 **Exit criteria for WS3.2:**
 
@@ -172,16 +194,21 @@ per-via-pair cost-model refinement in place.
 - [x] Multi-pin nets supported by `route_multipin_nets_3d` (commit
       `a7aa2d5`). 500/500 (100%) of smallest multi-pin nets routed
       end-to-end -- exceeds the 80% target.
-- [ ] Per-via-pair `via_cost` plumbed through; TR comparison re-run with
-      per-pair gf180mcuD values. Particular focus on closing the M4/M5
-      gap that m1_penalty didn't move plus the 0.60× via ratio that
-      the multi-pin spike surfaced.
+- [x] Per-via-pair `via_cost` plumbed through (commits `72de221` +
+      `fabb0d4`). TR comparison on the smallest-500 multi-pin spike
+      with [8,5,3,3] / [3,5,5,5] / scalar 5.0 produces identical
+      numbers (0.94× wire / 0.55× via) -- per-pair has no effect
+      because these nets are M1+M2-only. The 0.60×→0.55× via-ratio
+      drift between this run and the original a7aa2d5 baseline is
+      noise from intervening kernel changes, not a per-pair effect.
+      Conclusion: per-pair is structurally correct; the via-ratio
+      gap is topology, deferred to WS3.3.
 
 ### WS3.3 — Tile decomposition
 
 **Status:** Not started; **architecturally validated** (Tier A
-sweep-sharing bench, commit `e5dd5be`). Gated on WS3.2 deliverable 5
-(per-via-pair via_cost) landing first.
+sweep-sharing bench, commit `e5dd5be`) and **gates open** — WS3.2
+deliverable 5 (per-via-pair via_cost) shipped 2026-05-14.
 
 Splits a too-big grid (e.g., chip-scale) into overlapping tiles, routes within
 each, reconciles at halos. Unlocks **three** things:

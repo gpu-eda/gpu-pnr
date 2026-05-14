@@ -65,10 +65,44 @@ of the four intra-layer scans.
     while reading obstacle masks per layer-pair.
   - A correctness-preserving segmented-scan along `axis=0` that respects
     per-layer obstacles (the same offset trick as ADR 0005, but per layer).
-- **If `via_cost` becomes a per-via-pair array** (the natural next step,
-  see [`plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md))
-  — the sequential form trivially absorbs it; the parallel scan would have
-  needed a per-layer-pair cumsum.
+- **Per-via-pair `via_cost`** — landed 2026-05-14 (commits `72de221` +
+  `fabb0d4`). See "Amendment" below.
+
+## Amendment 2026-05-14: per-via-pair `via_cost`
+
+`via_cost` widened from `float` to `float | Sequence[float] | Tensor`
+of length `L-1`. Indexing convention: `via_cost[k]` is the edge
+weight between layer `k` and layer `k+1` (covers both up and down
+directions; vias are symmetric). The relax loops become:
+
+```python
+for l in range(1, L):
+    d[l] = torch.minimum(d[l], d[l-1] + via_costs[l-1])
+    d[l] = torch.where(obstacle_mask[l], inf, d[l])
+
+for l in range(L - 2, -1, -1):
+    d[l] = torch.minimum(d[l], d[l+1] + via_costs[l])
+    d[l] = torch.where(obstacle_mask[l], inf, d[l])
+```
+
+Both backtrace_3d and the dijkstra_grid_3d reference were updated to
+the same indexing convention; the sweep_sssp_3d_multi K-batched kernel
+mirrors it.
+
+**Why union typing instead of forcing `Tensor`:** ~30 existing
+callers pass scalar floats. Accepting both shapes preserves them
+without per-call churn, and a scalar broadcasts internally to a
+length-`(L-1)` tensor on `w.device`. `_autotune_seg_barrier` uses
+`max(via_costs)` for its worst-case-path bound — identical to the
+scalar case when all entries are equal.
+
+**Empirical note (negative result):** on the smallest-500 Hazard3
+multi-pin spike, per-pair via_costs had no measurable effect (all
+vectors produced identical numbers) because those nets are
+M1+M2-only and only Via1 is exercised. The per-pair API is still
+the right structural plumbing for WS3.3 chip-scale routing, where
+nets spanning M3+ will actually exercise Via2/Via3/Via4. See
+[`../results.md`](../results.md) Phase 3.2 multi-pin section.
 
 ## Links
 
