@@ -38,3 +38,4 @@ it. Never delete the old one.
 | 0009 | [Per-net independent grids for the Hazard3 spike](0009-per-net-grids.md) | Accepted 2026-05-11 |
 | 0010 | [Per-axis cost tensors (w, w_v) for preferred-direction routing](0010-per-axis-cost-tensors.md) | Accepted 2026-05-11. Amended 2026-05-11 (modeling-level correction). |
 | 0011 | [PDK technology rules encoded as structural constraints, not cost weights](0011-pdk-rules-as-structural-constraints.md) | Accepted 2026-05-11 |
+| 0012 | [Tile decomposition for chip-scale 3D routing](0012-tile-decomposition.md) | Proposed 2026-05-14 |

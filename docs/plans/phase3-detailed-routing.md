@@ -206,9 +206,9 @@ twice. WS3.3 is the right next step.
 
 ### WS3.3 — Tile decomposition
 
-**Status:** Not started; **architecturally validated** (Tier A
-sweep-sharing bench, commit `e5dd5be`) and **gates open** — WS3.2
-deliverable 5 (per-via-pair via_cost) shipped 2026-05-14.
+**Status:** Design ADR proposed 2026-05-14
+([ADR 0012](../adr/0012-tile-decomposition.md)). Implementation
+gated on the tile prototype below.
 
 Splits a too-big grid (e.g., chip-scale) into overlapping tiles, routes within
 each, reconciles at halos. Unlocks **three** things:
@@ -226,20 +226,30 @@ each, reconciles at halos. Unlocks **three** things:
    (see [`../results.md`](../results.md) Phase 3.2 investigation,
    Finding 4).
 
-Design choices to make when this starts:
+Design captured in [ADR 0012](../adr/0012-tile-decomposition.md). Key
+parameters:
 
-- **Tile size:** 256² × L=5 confirmed empirically as the throughput sweet
-  spot in 3D (Tier A). 512²+ tiles regress catastrophically at K=100 due
-  to MPS memory pressure on the multi-source distance tensor. **Lock 256²
-  for MPS targets; CUDA can reconsider larger tiles when implemented.**
-- **K-batch size:** 100 sources per multi-source call gives peak (4.05×)
-  throughput at 256². K=25-100 is the productive range; below K=10 the
-  GPU is launch-bound.
-- **Halo width:** must exceed the longest in-tile detour; data-dependent.
-- **Halo reconciliation strategy:** re-sweep within halos with both tiles'
-  committed routes visible, or run a global second pass on a coarsened grid.
-  *Cost model unknown until measured; the bull-case wafer.space wall-clock
-  in results.md assumes halo work doesn't dominate.*
+- **Tile size:** 256² × L=5 (locked from Tier A).
+- **K-batch size:** up to 100 sources per multi-source call (locked from
+  Tier A; productive range K=25–100).
+- **Halo width:** 32 cells (initial — to be refined by the tile prototype
+  below).
+- **Halo reconciliation:** iterative re-sweep within halo region with
+  both tiles' committed routes visible (option a). Walk-back to global
+  second pass on a coarsened grid if halo cost dominates.
+- **Multi-tile-spanning nets:** global coarsened-grid first pass
+  (estimated 5–15% of nets per the handoff's Hazard3 analysis).
+- **Per-tile net assignment:** bbox+halo fits in one tile → that
+  tile; else multi-tile path.
+
+**Next slice: tile prototype** (`scripts/tile_decomp_prototype.py`):
+pick a 256² × 5 sub-region of the Hazard3 chip, identify all
+multi-pin nets whose bbox+halo fits inside the tile, route them
+with `sweep_sssp_3d_multi` in K=100 batches. Measure wall-clock
+per K=100 batch (expect ~340 ms from Tier A), successful-route
+fraction, cross-net cell conflicts, and halo cell occupancy.
+Empirical anchor for halo-width refinement and reconciliation
+cost. ~2-3 hours of code.
 
 **Exit criteria for WS3.3:**
 
