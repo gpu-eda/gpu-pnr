@@ -64,10 +64,33 @@ def _obstacle_mask(w: torch.Tensor) -> torch.Tensor:
     return torch.isinf(w)
 
 
+def _normalize_via_cost(
+    via_cost: float | Sequence[float] | torch.Tensor,
+    L: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Normalize via_cost to a length-(L-1) tensor on (device, dtype).
+
+    Per-pair via_cost[k] is the edge weight between layer k and layer k+1
+    (covers both directions). A scalar input broadcasts to a uniform array.
+    For L=1 the result is a length-0 tensor (no vias).
+    """
+    n = L - 1
+    if isinstance(via_cost, (int, float)):
+        return torch.full((n,), float(via_cost), device=device, dtype=dtype)
+    vc = torch.as_tensor(via_cost, device=device, dtype=dtype)
+    if vc.shape != (n,):
+        raise ValueError(
+            f"via_cost must be scalar or shape ({n},), got {tuple(vc.shape)}"
+        )
+    return vc
+
+
 def _autotune_seg_barrier(
     w: torch.Tensor,
     obstacle_mask: torch.Tensor,
-    via_cost: float = 0.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 0.0,
     w_v: torch.Tensor | None = None,
     obstacle_mask_v: torch.Tensor | None = None,
 ) -> float:
@@ -106,7 +129,14 @@ def _autotune_seg_barrier(
     max_w_finite = max(max_w_h, max_w_v, 1.0)
     spatial_dims = w.shape[-2:]
     layer_dim = w.shape[0] if w.ndim == 3 else 1
-    max_legit_hint = sum(spatial_dims) * max_w_finite + layer_dim * via_cost
+    if isinstance(via_cost, torch.Tensor):
+        via_max = float(via_cost.max().item()) if via_cost.numel() else 0.0
+    elif isinstance(via_cost, (int, float)):
+        via_max = float(via_cost)
+    else:
+        seq = list(via_cost)
+        via_max = max(seq) if seq else 0.0
+    max_legit_hint = sum(spatial_dims) * max_w_finite + layer_dim * via_max
 
     # max_seg_id is the largest cumulative obstacle count along any axis; since
     # cumsum is non-decreasing, max(cumsum(mask, axis)) == max(sum(mask, axis)).
@@ -320,7 +350,7 @@ def sweep_sssp_multi(
 def sweep_sssp_3d(
     w: torch.Tensor,
     source: tuple[int, int, int],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     max_iters: int = 200,
     check_every: int = 8,
     seg_barrier: float | None = None,
@@ -361,7 +391,11 @@ def sweep_sssp_3d(
             Also used for axis=1 ("V") moves when `w_v` is not given. inf for
             obstacles.
         source: (layer, row, col).
-        via_cost: edge weight for one via transition between adjacent layers.
+        via_cost: edge weight for via transitions. Either a scalar (uniform
+            cost on every via pair) or a length-(L-1) sequence/tensor giving
+            per-pair costs, where `via_cost[k]` is the edge weight between
+            layer `k` and layer `k+1` (covers both directions). Used to model
+            DRC/resistance differences between Via1, Via2, ... on real PDKs.
         max_iters, check_every: as in `sweep_sssp`.
         seg_barrier: optional override; otherwise autotuned from both axes.
         w_v: optional (L, H, W) cost tensor for axis=1 ("V") moves. If None,
@@ -379,6 +413,7 @@ def sweep_sssp_3d(
         (d, iters) where d is the (L, H, W) distance tensor.
     """
     L = w.shape[0]
+    via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
     d = torch.full_like(w, float("inf"))
     sl, sr, sc = source
     d[sl, sr, sc] = 0.0
@@ -396,7 +431,7 @@ def sweep_sssp_3d(
         seg_barrier = _autotune_seg_barrier(
             w,
             mask_h,
-            via_cost=via_cost,
+            via_cost=via_costs,
             w_v=w_v,
             obstacle_mask_v=mask_v if w_v is not None else None,
         )
@@ -410,10 +445,10 @@ def sweep_sssp_3d(
         d = _sweep_forward(d, fwd_v, axis=1)
         d = _sweep_backward(d, bwd_v, axis=1)
         for lyr in range(1, L):
-            d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + via_cost)
+            d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + via_costs[lyr - 1])
             d[lyr] = torch.where(mask_via[lyr], inf_scalar, d[lyr])
         for lyr in range(L - 2, -1, -1):
-            d[lyr] = torch.minimum(d[lyr], d[lyr + 1] + via_cost)
+            d[lyr] = torch.minimum(d[lyr], d[lyr + 1] + via_costs[lyr])
             d[lyr] = torch.where(mask_via[lyr], inf_scalar, d[lyr])
         return d
 
@@ -458,7 +493,7 @@ def axis_costs(
 def sweep_sssp_3d_multi(
     w: torch.Tensor,
     sources: list[tuple[int, int, int]],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     max_iters: int = 200,
     check_every: int = 8,
     seg_barrier: float | None = None,
@@ -477,14 +512,16 @@ def sweep_sssp_3d_multi(
     Args:
         w: (L, H, W) cost tensor for axis=2 ("H") moves.
         sources: list of K (layer, row, col) source coords.
-        via_cost, max_iters, check_every, seg_barrier, w_v: as in
-            `sweep_sssp_3d`.
+        via_cost: scalar or length-(L-1) per-pair via costs; see
+            `sweep_sssp_3d` for the indexing convention.
+        max_iters, check_every, seg_barrier, w_v: as in `sweep_sssp_3d`.
 
     Returns:
         (d, iters) where d is (K, L, H, W).
     """
     K = len(sources)
     L, H, W = w.shape
+    via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
     d = torch.full((K, L, H, W), float("inf"), device=w.device, dtype=w.dtype)
     for k, (sl, sr, sc) in enumerate(sources):
         d[k, sl, sr, sc] = 0.0
@@ -500,7 +537,7 @@ def sweep_sssp_3d_multi(
         seg_barrier = _autotune_seg_barrier(
             w,
             mask_h,
-            via_cost=via_cost,
+            via_cost=via_costs,
             w_v=w_v,
             obstacle_mask_v=mask_v if w_v is not None else None,
         )
@@ -518,10 +555,10 @@ def sweep_sssp_3d_multi(
         d = _sweep_forward(d, fwd_v, axis=2)
         d = _sweep_backward(d, bwd_v, axis=2)
         for lyr in range(1, L):
-            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + via_cost)
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + via_costs[lyr - 1])
             d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
         for lyr in range(L - 2, -1, -1):
-            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + via_cost)
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + via_costs[lyr])
             d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
         return d
 
@@ -573,7 +610,7 @@ def backtrace_3d(
     w: torch.Tensor,
     source: tuple[int, int, int],
     sink: tuple[int, int, int],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     atol: float = 1e-5,
     w_v: torch.Tensor | None = None,
     extra_sources: Sequence[tuple[int, int, int]] = (),
@@ -587,7 +624,8 @@ def backtrace_3d(
     is None it falls back to `w` for both directions (isotropic).
 
     Falls back to cross-layer via neighbors at the same (r, c) on the layer
-    above or below (predecessor distance = d[cur] - via_cost).
+    above or below. Per-pair via_cost: a step from cur_l to neighbor cur_l-1
+    uses `via_cost[cur_l - 1]`; a step to cur_l+1 uses `via_cost[cur_l]`.
 
     With `extra_sources` non-empty, the walk terminates upon reaching `source`
     OR any cell in `extra_sources` -- the first complete predecessor chain
@@ -600,6 +638,16 @@ def backtrace_3d(
     sl, sr, sc = source
     tl, ti, tj = sink
     L, H, W = d.shape
+    if isinstance(via_cost, torch.Tensor):
+        via_costs_list = [float(v) for v in via_cost.tolist()]
+    elif isinstance(via_cost, (int, float)):
+        via_costs_list = [float(via_cost)] * (L - 1)
+    else:
+        via_costs_list = [float(v) for v in via_cost]
+    if len(via_costs_list) != L - 1:
+        raise ValueError(
+            f"via_cost must be scalar or length ({L - 1},), got {len(via_costs_list)}"
+        )
     terminal_cells: set[tuple[int, int, int]] = {(sl, sr, sc), *extra_sources}
 
     if not torch.isfinite(d[tl, ti, tj]):
@@ -611,7 +659,7 @@ def backtrace_3d(
     while (cur_l, cur_i, cur_j) not in terminal_cells:
         h_target = (d[cur_l, cur_i, cur_j] - w[cur_l, cur_i, cur_j]).item()
         v_target = (d[cur_l, cur_i, cur_j] - w_v[cur_l, cur_i, cur_j]).item()
-        via_target = (d[cur_l, cur_i, cur_j] - via_cost).item()
+        cur_d = d[cur_l, cur_i, cur_j].item()
         moved = False
         for di, dj in ((-1, 0), (1, 0), (0, -1), (0, 1)):
             ni, nj = cur_i + di, cur_j + dj
@@ -627,7 +675,9 @@ def backtrace_3d(
         for dl in (-1, 1):
             nl = cur_l + dl
             if 0 <= nl < L and torch.isfinite(d[nl, cur_i, cur_j]):
-                if abs(d[nl, cur_i, cur_j].item() - via_target) <= atol:
+                # via index between layers min(cur_l, nl) and that+1
+                vc = via_costs_list[cur_l - 1] if dl == -1 else via_costs_list[cur_l]
+                if abs(d[nl, cur_i, cur_j].item() - (cur_d - vc)) <= atol:
                     path.append((nl, cur_i, cur_j))
                     cur_l = nl
                     moved = True

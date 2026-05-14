@@ -414,3 +414,118 @@ def test_backtrace_extra_sources_terminates_at_any_seed():
         f"backtrace should attach at the nearer extra source {extras[0]}, "
         f"got {path[0]}"
     )
+
+
+# --- per-pair via_cost tests -------------------------------------------------
+
+
+def test_per_pair_via_cost_scalar_equivalence():
+    """A length-(L-1) array of identical values must produce the same
+    distances as the scalar of that value. Backwards-compat anchor."""
+    torch.manual_seed(40)
+    L, H, W = 5, 12, 12
+    w = torch.rand(L, H, W) + 0.1
+    w[2, 5, 3:9] = math.inf
+    source = (0, 0, 0)
+    scalar_v = 0.7
+    d_scalar, _ = sweep_sssp_3d(w, source, via_cost=scalar_v)
+    d_array, _ = sweep_sssp_3d(w, source, via_cost=[scalar_v] * (L - 1))
+    _assert_distances_match(d_array, d_scalar, atol=1e-3)
+
+
+def test_per_pair_via_cost_asymmetric_steers_routing():
+    """When via_cost[0] is huge (M1-M2 expensive) but via_cost[1] is cheap
+    (M2-M3 cheap), a path forced through both vias should reflect the
+    different costs."""
+    L, H, W = 3, 6, 6
+    w = torch.ones(L, H, W)
+    source = (0, 0, 0)
+    sink = (2, 0, 0)
+    # via_costs[0] = 100 (M1<->M2), via_costs[1] = 1 (M2<->M3)
+    d, _ = sweep_sssp_3d(w, source, via_cost=[100.0, 1.0])
+    # Distance must equal 100 + 1 = 101 (two vias, distinct costs).
+    assert abs(float(d[sink]) - 101.0) < 1e-3, f"got d[sink]={float(d[sink])}"
+    # Reverse: cheap first via, then expensive.
+    d2, _ = sweep_sssp_3d(w, source, via_cost=[1.0, 100.0])
+    assert abs(float(d2[sink]) - 101.0) < 1e-3, f"got d2[sink]={float(d2[sink])}"
+    # Single layer-1 hop must reflect only the first via.
+    assert abs(float(d[(1, 0, 0)]) - 100.0) < 1e-3
+    assert abs(float(d2[(1, 0, 0)]) - 1.0) < 1e-3
+
+
+def test_per_pair_via_cost_matches_dijkstra():
+    """Random cost grid + asymmetric per-pair via_cost: sweep must match
+    Dijkstra reference."""
+    torch.manual_seed(41)
+    L, H, W = 4, 10, 10
+    w = torch.rand(L, H, W) + 0.1
+    w[1, 4, 2:8] = math.inf
+    w[2, 7, 1:5] = math.inf
+    source = (0, 0, 0)
+    via_costs = [3.0, 1.0, 5.0]
+    d_sweep, _ = sweep_sssp_3d(w, source, via_cost=via_costs)
+    d_ref = dijkstra_grid_3d(w, source, via_cost=via_costs)
+    _assert_distances_match(d_sweep, d_ref, atol=5e-2)
+
+
+def test_per_pair_via_cost_backtrace_uses_correct_per_step_cost():
+    """Backtrace under asymmetric per-pair via_cost reconstructs a path
+    whose summed cost matches d[sink]. The via_target check must index
+    via_cost[cur_l-1] when stepping down, via_cost[cur_l] when stepping up."""
+    torch.manual_seed(42)
+    L, H, W = 4, 8, 8
+    w = torch.rand(L, H, W) + 0.1
+    w_h, w_v = axis_costs(w, [1.0, 5.0, 1.0, 5.0], [5.0, 1.0, 5.0, 1.0])
+    source = (0, 0, 0)
+    sink = (3, 7, 7)
+    via_costs = [2.0, 0.5, 4.0]
+    d, _ = sweep_sssp_3d(w_h, source, via_cost=via_costs, w_v=w_v)
+    path = backtrace_3d(
+        d.cpu(), w_h.cpu(), source, sink, via_cost=via_costs, w_v=w_v.cpu()
+    )
+    assert path is not None
+    assert path[0] == source
+    assert path[-1] == sink
+    total = 0.0
+    for (l1, i1, j1), (l2, i2, j2) in zip(path, path[1:]):
+        if l1 == l2 and i1 == i2 and abs(j1 - j2) == 1:
+            total += float(w_h[l2, i2, j2])
+        elif l1 == l2 and j1 == j2 and abs(i1 - i2) == 1:
+            total += float(w_v[l2, i2, j2])
+        elif abs(l1 - l2) == 1 and i1 == i2 and j1 == j2:
+            total += via_costs[min(l1, l2)]
+        else:
+            raise AssertionError(f"non-adjacent step {(l1, i1, j1)} -> {(l2, i2, j2)}")
+    assert abs(total - float(d[sink])) <= 5e-2, (
+        f"path cost {total} disagrees with d[sink]={float(d[sink])}"
+    )
+
+
+def test_sweep_sssp_3d_multi_per_pair_matches_per_source():
+    """K-batched 3D sweep with per-pair via_cost must equal per-source
+    runs with the same per-pair via_cost."""
+    torch.manual_seed(43)
+    L, H, W = 4, 10, 10
+    w = torch.rand(L, H, W) + 0.1
+    via_costs = [2.0, 0.5, 4.0]
+    sources = [(0, 0, 0), (3, 9, 9), (1, 4, 4)]
+    d_multi, _ = sweep_sssp_3d_multi(w, sources, via_cost=via_costs)
+    for k, s in enumerate(sources):
+        d_single, _ = sweep_sssp_3d(w, s, via_cost=via_costs)
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_multi[k].cpu()[finite.cpu()], d_single.cpu()[finite.cpu()],
+            atol=5e-2,
+        ), f"source {k}={s}: K-batched per-pair diverges from single-source"
+
+
+def test_per_pair_via_cost_wrong_length_raises():
+    """Per-pair array of wrong shape must raise."""
+    L, H, W = 3, 4, 4
+    w = torch.ones(L, H, W)
+    try:
+        sweep_sssp_3d(w, (0, 0, 0), via_cost=[1.0, 2.0, 3.0])  # need L-1=2
+    except ValueError as e:
+        assert "via_cost must be scalar or shape (2,)" in str(e)
+    else:
+        raise AssertionError("expected ValueError")

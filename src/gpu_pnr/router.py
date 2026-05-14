@@ -17,7 +17,7 @@ different layers at the same (row, col) are distinct cells.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -153,7 +153,7 @@ def route_nets(
 def route_nets_3d(
     w: torch.Tensor,
     nets: list[tuple[tuple[int, int, int], tuple[int, int, int]]],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     reserve_pins: bool = True,
     w_v: torch.Tensor | None = None,
 ) -> list[Net3DResult]:
@@ -164,7 +164,9 @@ def route_nets_3d(
             Also used for axis=1 ("V") moves when `w_v` is not given.
             inf for obstacles.
         nets: ordered list of ((layer, row, col), (layer, row, col)) pairs.
-        via_cost: edge weight for one via transition between adjacent layers.
+        via_cost: scalar (uniform) or length-(L-1) per-pair via costs. Pair
+            `k` is the edge weight between layer `k` and layer `k+1`. See
+            `gpu_pnr.sweep.sweep_sssp_3d` for details.
         reserve_pins: if True, all pin cells (across all layers) are reserved
             as obstacles before routing; each net's own pins are temporarily
             un-reserved while it routes.
@@ -242,7 +244,7 @@ def route_nets_3d(
 def route_multipin_nets_3d(
     w: torch.Tensor,
     nets: list[list[tuple[int, int, int]]],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     reserve_pins: bool = True,
     w_v: torch.Tensor | None = None,
     net_timeout_s: float | None = None,

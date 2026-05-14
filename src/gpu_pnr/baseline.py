@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import heapq
 import math
+from collections.abc import Sequence
 
 import torch
 
@@ -50,7 +51,7 @@ def dijkstra_grid(
 def dijkstra_grid_3d(
     w: torch.Tensor,
     source: tuple[int, int, int],
-    via_cost: float = 1.0,
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
     w_v: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Standard Dijkstra on a multi-layer 4-connected grid with via edges.
@@ -76,6 +77,16 @@ def dijkstra_grid_3d(
     w_v_np = w_v.detach().cpu().numpy() if w_v is not None else w_h_np
     L, H, W = w_h_np.shape
     sl, sr, sc = source
+    if isinstance(via_cost, torch.Tensor):
+        via_costs = [float(v) for v in via_cost.tolist()]
+    elif isinstance(via_cost, (int, float)):
+        via_costs = [float(via_cost)] * (L - 1)
+    else:
+        via_costs = [float(v) for v in via_cost]
+    if len(via_costs) != L - 1:
+        raise ValueError(
+            f"via_cost must be scalar or length ({L - 1},), got {len(via_costs)}"
+        )
 
     d = [[[math.inf] * W for _ in range(H)] for _ in range(L)]
     d[sl][sr][sc] = 0.0
@@ -104,7 +115,8 @@ def dijkstra_grid_3d(
                     float(w_v_np[nl, i, j])
                 ):
                     continue
-                new_d = cur_d + via_cost
+                vc = via_costs[lyr - 1] if dl == -1 else via_costs[lyr]
+                new_d = cur_d + vc
                 if new_d < d[nl][i][j]:
                     d[nl][i][j] = new_d
                     heapq.heappush(pq, (new_d, nl, i, j))

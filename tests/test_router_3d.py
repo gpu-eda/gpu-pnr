@@ -254,3 +254,28 @@ def test_anisotropic_pin_reservation_blocks_both_axes():
     )
     assert with_res[0].routed
     assert with_res[1].routed
+
+
+def test_route_nets_3d_per_pair_via_cost():
+    """route_nets_3d plumbs per-pair via_cost into the kernel. A net spanning
+    M1->M3 traverses two distinct via pairs; the path must complete with
+    asymmetric per-pair via_cost."""
+    L, H, W = 3, 4, 4
+    w = torch.ones(L, H, W)
+    nets = [((0, 0, 0), (2, 0, 0))]
+    via_costs = [50.0, 1.0]
+    results = route_nets_3d(w, nets, via_cost=via_costs)
+    path = results[0].path
+    assert path is not None
+    # Path: (0,0,0) -> (1,0,0) -> (2,0,0). Two via edges (one per pair).
+    assert len(path) == 3
+
+
+def test_route_multipin_nets_3d_per_pair_via_cost():
+    """route_multipin_nets_3d plumbs per-pair via_cost into the kernel."""
+    L, H, W = 3, 6, 6
+    w = torch.ones(L, H, W)
+    nets = [[(0, 0, 0), (2, 5, 5), (1, 2, 2)]]
+    via_costs = [3.0, 1.0]
+    results = route_multipin_nets_3d(w, nets, via_cost=via_costs)
+    assert results[0].routed
