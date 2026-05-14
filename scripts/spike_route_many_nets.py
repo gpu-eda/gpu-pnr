@@ -17,7 +17,7 @@ heuristics on top: each layer's non-preferred axis is multiplied by
 via-stacks between layers so each wire segment travels along its layer's
 cheap axis.
 
-Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT] [M1_PENALTY] [NO_PDK_RULES] [MULTIPIN]
+Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT] [M1_PENALTY] [NO_PDK_RULES] [MULTIPIN] [VIA_COSTS]
   N defaults to 50, SEED defaults to 0, OFF_MULT defaults to 1.0 (isotropic),
   M1_PENALTY defaults to 1.0 (a debug knob -- redundant under PDK rules
   but kept for ablation studies).
@@ -28,6 +28,10 @@ Run: uv run python scripts/spike_route_many_nets.py [N] [SEED] [OFF_MULT] [M1_PE
   them via route_multipin_nets_3d (incremental tree growth). When 0
   the spike samples 2-pin nets only and uses route_nets_3d, preserving
   historical TR-comparison numbers.
+  VIA_COSTS (default "5.0"): either a single float (uniform across all
+  via pairs) or a comma-separated list of length L-1 = 4 giving per-pair
+  via costs Via1,Via2,Via3,Via4 between Metal1..Metal5. e.g. "8,5,3,3"
+  makes M1<->M2 vias expensive to push routing toward upper layers.
 """
 
 from __future__ import annotations
@@ -62,6 +66,14 @@ def main() -> None:
     m1_penalty = float(sys.argv[4]) if len(sys.argv) > 4 else 1.0
     no_pdk_rules = bool(int(sys.argv[5])) if len(sys.argv) > 5 else False
     multipin = bool(int(sys.argv[6])) if len(sys.argv) > 6 else False
+    via_costs_arg = sys.argv[7] if len(sys.argv) > 7 else "5.0"
+    via_cost_parts = [float(x) for x in via_costs_arg.split(",")]
+    if len(via_cost_parts) == 1:
+        via_cost: float | list[float] = via_cost_parts[0]
+        print(f"via_cost: scalar {via_cost} (uniform across all via pairs)")
+    else:
+        via_cost = via_cost_parts
+        print(f"via_cost: per-pair {via_cost} (Via1..Via{len(via_cost)})")
     random.seed(seed)
     apply_rules = not no_pdk_rules
     if no_pdk_rules:
@@ -115,7 +127,6 @@ def main() -> None:
     sample = candidates[:n]
     print(f"  picking smallest {len(sample)} nets for the spike\n")
 
-    via_cost = 5.0
     total_routed = 0
     total_wl_cells = 0
     total_vias = 0
