@@ -1,6 +1,6 @@
-# Handoff — WS3.3 tile decomposition: build the chip-scale router using sweep-sharing per tile
+# Handoff — WS3.3 tile decomposition: substrate validated, full chip-scale router still to build
 
-**Created:** 2026-05-13
+**Created:** 2026-05-15 (rewritten after substrate validation session)
 **Working tree:** clean
 **Branch:** main
 
@@ -14,172 +14,177 @@ See docs/handoff-discipline.md for the migration table.
 
 ## Goal & next-up
 
-**Goal of this session:** validated the WS3.3 architectural premise
-(sweep-sharing amortises at 256² × K=100 = 4× in 3D, Tier A spike) and
-empirically measured the worst-case "no-decomposition" baseline (chip-scale
-single grid = 327 s per 2-pin net). Both pieces clear the runway for
-WS3.3 itself, which is *not* yet built. The kernel-level optimization
-profile is also captured for use during WS3.3 implementation.
+**Goal of this session:** Lock the WS3.3 tile-decomposition design in
+an ADR and validate the tile-shared cost-grid substrate on a real
+Hazard3 tile, ahead of building the full chip-scale tile router.
+Both done; substrate is correct. WS3.2 also closed out (per-pair
+`via_cost` shipped as API plumbing — empirically silent on the
+smallest-500 multi-pin spike, but structurally necessary for WS3.3).
 
 **Next session should pick up:** [Phase 3 plan WS3.3 — Tile
 decomposition](../plans/phase3-detailed-routing.md#ws33--tile-decomposition).
-Open architectural questions are listed in the plan; start by writing the
-WS3.3 design ADR or sketching `scripts/tile_decomp_prototype.py` (single
-tile, real Hazard3 sub-region, full multi-source K-batched routing) per
-"Critical context" below.
+Specifically: build `src/gpu_pnr/tile_router.py` per
+[ADR 0012](../adr/0012-tile-decomposition.md) — the full chip-scale
+tile manager that iterates tiles, batches K=100 nets per tile via
+`sweep_sssp_3d_multi`, reconciles halos, and routes
+multi-tile-spanning nets on a coarsened grid first.
 
 **Verification command:**
 
 ```sh
 cd ~/Code/gpu-pnr && uv run pytest tests/
-# Expect: 61 passed
+# Expect: 69 passed
 
-# Optional: regenerate the Tier A 3D bench numbers
-uv run python scripts/bench_sweep_sharing.py --mode 3d --size 256 \
-  --layers 5 --via-cost 5.0 --ks 1 10 25 50 100
-# Expect: K=100 ~4x speedup, ~31 ms/source on M-series MPS
+# Optional: re-run the tile prototype to confirm substrate correctness
+uv run python scripts/tile_decomp_prototype.py 256 32 1.0
+# Expect: 0 cross-net cell conflicts; 22% routability is the
+# pin-extraction artifact, not a regression.
 ```
 
 ## Done this session
 
 | Commit | Subject | Notes |
 |---|---|---|
-| `907f632` | Encode M1-as-pin-only as a PDK rule (WS3.2 deliverable 3) | Pdk dataclass + apply_pin_access_rules; N=500 spike numbers unchanged. |
-| `eb42447` | docs: ADR 0011 + plan WS3.2 deliverable 3 marked shipped | ADR 0011 captures structural-vs-cost split. |
-| `a7aa2d5` | Multi-pin nets via incremental tree growth (WS3.2 deliverable 4) | route_multipin_nets_3d + 8 new tests; 0.94×/0.60× vs TR at N=500 multi-pin. |
-| `e687e41` | Renderer chip mode: --multipin flag for 3+-pin nets | Renderer supports multi-pin via _sample_nets generalisation. |
-| `41bc65a` | docs: WS3.2 deliverable 4 marked shipped + results section | Multi-pin results captured. |
-| `edd53a9` | Multi-pin safeguards: per-net timeout + progress logging + pin-count cap | net_timeout_s on route_multipin_nets_3d; MAX_PINS=20. |
-| `e5dd5be` | Add sweep_sssp_3d_multi kernel + 3D sweep-sharing bench (Tier A) | The kernel WS3.3 will use; 4.05× at 256² × K=100. |
-| `9e87e89` | docs: Tier A sweep-sharing spike resolved YES at 256³ | Tier A spike doc + results.md + plan update. |
-| `7acfd69` | Chip-scale prototype + kernel profile: per-iter bottleneck breakdown | Chip-scale single-grid baseline + PyTorch profile findings. |
+| `72de221` | Per-pair via_cost in 3D sweep, router, and reference (WS3.2 deliverable 5) | API change: scalar → `float \| Sequence[float] \| Tensor`. 8 new tests. |
+| `fabb0d4` | Spike: per-pair via_costs CLI knob + multi-pin smallest-500 measurement | Negative result: per-pair has no effect on M1+M2-only workload. |
+| `620e366` | docs: per-pair via_cost shipped — plan + results + ADR 0006 amendment | WS3.2 fully shipped (all exit criteria checked). |
+| `1f46567` | docs: ADR 0012 — tile decomposition design for WS3.3 | Design captured; tile=256², K=100, halo=32 initial, iterative halo re-sweep, coarsened pass for multi-tile-spanning nets. |
+| `26f0251` | WS3.3 tile prototype: route one 256² × 5 Hazard3 tile (ADR 0012) | Substrate validated: 0 conflicts, 22% routability all from pin-collision (extraction artifact, not a bug). |
+| `ce88593` | docs: ADR 0012 Accepted; fold tile-prototype findings into Decision | ADR moves Proposed → Accepted with prototype evidence. |
 
 ## Open follow-ups (priority-ordered)
 
-### 1. WS3.3 design decision: write an ADR or jump straight to a tile prototype? (small-to-medium)
+### 1. Full tile-decomposition router (large; ~1-2 days)
 
-The architectural pieces are mostly empirically settled. **Locked design
-parameters** (from Tier A):
+`src/gpu_pnr/tile_router.py` per [ADR 0012](../adr/0012-tile-decomposition.md).
+Shape:
 
-- Tile size: 256² × L=5 layers. Memory ~6.5 MB per tile cost tensor; multi-source distance tensor for K=100 = 660 MB (well within the 30 GB MPS cap).
-- K-batch size: 100 sources per `sweep_sssp_3d_multi` call gives peak 4.05× speedup.
-- Sweep-sharing primitive: `sweep_sssp_3d_multi` (commit `e5dd5be`) — tested, validated.
+- `TileRouter` class API-compatible with `route_multipin_nets_3d`
+  (`route(nets) -> list[MultiPin3DResult]`).
+- Partition the chip into 256² owned tiles with halo=32 → 320²
+  routable per tile. Iterate tiles in some order (HPWL-ascending
+  per [ADR 0007](../adr/0007-hpwl-ascending-net-ordering.md) by tile, then by
+  net within tile).
+- Per-tile: batch up to K=100 nets through `sweep_sssp_3d_multi`,
+  backtrace each, detect conflicts, ripup/reroute conflicts. The
+  conflict-detect-and-ripup logic is the deferred
+  [`route_nets_batched`](../adr/0008-defer-route-nets-batched.md);
+  building it on top of a tile-bounded substrate is what makes it
+  worth doing.
+- Multi-tile-spanning nets (bbox + halo crosses tile boundary): route
+  globally on a 4× coarsened grid first; pin those routes as
+  obstacles in the per-tile passes.
+- Halo reconciliation: after both adjacent tiles commit, re-sweep
+  halo cells with both tiles' committed routes visible; ripup-reroute
+  any halo conflicts. ADR 0012 picked option (a) iterative re-sweep;
+  walk back to option (b) global-second-pass if local re-sweep
+  doesn't converge.
 
-**Open architectural decisions** (worth an ADR; ~1-2 hours to draft):
+Initial measurements to capture in `docs/results.md` Phase 3.3
+section:
+- Wall-clock per tile, end-to-end on Hazard3 (expect ~22-44 min total
+  on MPS per the bull-case extrapolation).
+- Cross-net conflicts (must stay 0).
+- Multi-tile-spanning net fraction (estimated 5-15%; if >25%, revisit
+  per-tile net assignment).
+- Halo cell occupancy across tiles (refines halo width — 0% on the
+  prototype's M1+M2 workload means insufficient signal yet).
 
-- **Halo width.** Must exceed the longest in-tile detour. Data-dependent; estimate from Hazard3's longest 2-pin route bbox (probably ~5-20 cells).
-- **Halo reconciliation strategy.** Two candidates: (a) re-sweep within halos after each tile sees adjacent tiles' committed routes, or (b) global second pass on a coarsened grid. (a) is simpler to implement, (b) handles non-local detours better.
-- **Multi-tile-spanning nets.** Nets whose bbox crosses tile boundaries: route them globally on a chip-scale grid first (slow but rare; ~5-15% of nets per the Tier A spike's analysis), or route them per-tile with halo handshake?
-- **Per-tile net assignment.** Each tile owns some set of nets; assignment policy: bbox-center-in-tile, or split nets across tiles they touch.
-
-### 2. Tile prototype: route one Hazard3 tile end-to-end (medium)
-
-`scripts/tile_decomp_prototype.py`: pick a 256² × 5 sub-region of the
-Hazard3 chip, identify all 2-pin and small multi-pin nets whose bbox
-fits inside that single tile (skip nets crossing tile boundaries for
-now), route them with `sweep_sssp_3d_multi` in K=100 batches. Measure:
-
-- wall-clock per K=100 batch (expect ~340 ms from Tier A)
-- successful-route fraction
-- cross-net cell conflicts (should be 0 since we share the grid)
-- comparison vs `route_multipin_nets_3d` on the same nets sequentially (baseline)
-
-This validates the design before building the full chip-scale tile
-manager. Probably 2-3 hours of code.
-
-### 3. Full tile-decomposition router (large)
-
-A new module — likely `src/gpu_pnr/tile_router.py` — that:
-
-- Partitions the chip into 256² tiles with configurable overlap (halo).
-- Assigns each net to a tile based on bbox.
-- Routes each tile's nets via `sweep_sssp_3d_multi` (K=100 batches).
-- Reconciles halos (re-sweep within overlap regions; see decision 1 above).
-- Handles multi-tile-spanning nets via a fallback path.
-- Returns per-net `MultiPin3DResult` data structurally compatible with
-  the existing `route_multipin_nets_3d` API.
-
-Roughly 1-2 days of focused work, gated on (1) and (2).
-
-### 4. Kernel optimization within tiles (medium; optional, post-WS3.3)
+### 2. Kernel optimization within tiles (medium; optional, post-WS3.3)
 
 From `scripts/profile_chip_sweep.py` findings (commit `7acfd69`):
 
 - `aten::where`: 49% (memory-bound)
-- `aten::_local_scalar_dense`: 28% (.item() syncs)
+- `aten::_local_scalar_dense`: 28% (.item() syncs in
+  `_autotune_seg_barrier`)
 - `aten::flip`: 13%
 
-Headroom: 1.5-3× per-iter speedup via `torch.compile` operator fusion +
-eliminating `.item()` syncs in `_autotune_seg_barrier`. **Defer until WS3.3
-is working;** chasing this before tile decomposition is premature.
+Headroom: 1.5-3× per-iter speedup via `torch.compile` operator
+fusion + eliminating `.item()` syncs. **Defer until item 1 lands;**
+chasing this before the full router exists is premature.
+
+### 3. Pin extraction from DEF (small; orthogonal)
+
+The tile prototype's 22% routability is an artifact of using
+guide-rect centers as pin coords. Real ASIC routers pull pin
+coordinates from the DEF's PIN / COMPONENT sections. Improving the
+extraction would let the prototype (and ultimately the full router)
+measure real routability without the cell-quantization collisions.
+Orthogonal to the WS3.3 substrate; can land any time.
 
 ## Critical context
 
-**Tile decomposition is fundamentally different from per-net mini-grids.**
-The current spike's per-net mini-grids (via `build_grid(rects)` per net) are
-*a* form of decomposition — small grids, one per net, with no shared state.
-Tile decomposition is fixed-size spatial tiles where *many nets share one
-tile grid*. The key difference: per-net mini-grids can't prevent inter-net
-cell conflicts (different nets routing through the same chip cell from
-their own mini-grids); tile decomposition can, because all nets in a tile
-see the same `w_cur`.
+**ADR 0012 locked the substrate; the prototype confirmed it
+works.** The next session does not need to re-prove tile-shared
+correctness or re-pick tile size. The substrate (256² owned + 32
+halo, sequential routing on shared `w_cur`) produces 0 cross-net
+conflicts on real Hazard3 nets. The full router builds on top of
+this without re-litigating fundamentals.
 
-**`route_multipin_nets_3d` is the right interface, the wrong granularity.**
-It already takes a list of nets, applies pin reservation across all of
-them, and commits each net's cells as inf for the next. The "shared
-working grid" semantics are exactly what tile decomposition needs. The
-missing piece is *partitioning* — picking which nets go in which tile —
-and *batching* — using `sweep_sssp_3d_multi` for K nets in parallel
-instead of one-at-a-time. So the tile router can probably reuse most of
-`route_multipin_nets_3d`'s pin-reservation logic.
+**The halo width may need to drop — but we don't know yet.** Halo
+occupancy was 0% on the prototype's densest Hazard3 tile because
+that tile is M1+M2-confined (670 of 694 cells on M2). The natural
+use of halo is M3+ via-stack detours, which this workload doesn't
+exercise. The full router will route nets across many tiles
+including M3+ traffic; halo measurement there is the load-bearing
+data for refinement. Don't drop halo speculatively.
 
-**The chip-scale prototype (commit `7acfd69`) was the worst-case baseline,
-not tile decomposition.** It builds one giant grid for the whole chip and
-routes sequentially. The 327 s/net wall-clock is the *upper bound* —
-proves tile decomposition is *needed*, not just *nice to have*. Don't
-mistake the prototype for a step toward WS3.3; it was a "what if we
-didn't decompose at all" experiment.
+**Multi-tile-spanning nets are the highest-risk piece.** The ADR
+picks "coarsened-grid global first pass" for these. If on Hazard3
+that fraction is >25% (vs the estimated 5-15%), or if the coarsened
+pass is too lossy, walk back per ADR 0012's walk-back options.
+Measure early.
 
-**Tier A numbers (commit `e5dd5be`) lock the tile-size choice.** Don't
-re-litigate 256² vs 512² without new data — the 3D 512² K=100 collapse to
-0.19× was measured and is in `docs/spikes/tier-a-sweep-sharing-throughput.md`.
+**`sweep_sssp_3d_multi` K=100 throughput at 256² × 5 is empirically
+~31 ms/source** (Tier A spike). The full router's per-tile K-batched
+pass should hit that regime; if it doesn't, profile before
+optimizing. ADR 0012's wall-clock estimate (22-44 min for Hazard3 on
+MPS) depends on hitting it.
 
-**Wafer.space-scale extrapolation depends on this work landing.** The
-"3-10× faster than TR at wafer.space scale" claim in `docs/results.md`
-Phase 3.2 sweep-sharing section assumes WS3.3 lands with the predicted
-per-tile throughput. If halo reconciliation costs much more than expected,
-that ratio shrinks. Validate halo cost early (in tile prototype step 2).
+**Per-pair `via_cost` is API-only on this workload.** WS3.2
+deliverable 5 shipped the structurally-correct per-pair plumbing,
+but on Hazard3's smallest-500 multi-pin nets it has no measurable
+effect — those nets are M1+M2-only. The 0.55× via-ratio gap vs
+TritonRoute is **tree-topology**, not cost-model. The full tile
+router doesn't change that; topology improvement is a separate
+workstream if it ever lands. Per-pair will become a measurable
+lever on nets that cross M3+ via stacks, expected in chip-scale
+runs.
 
 ## References
 
 - [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)
-  — WS3.3 section, "Status: not started; architecturally validated."
+  — WS3.3 section. Captures the design summary and the queued
+  prototype/next-slice.
+- [ADR 0012](../adr/0012-tile-decomposition.md) — locked
+  substrate design; Accepted with prototype evidence.
 - [`../spikes/tier-a-sweep-sharing-throughput.md`](../spikes/tier-a-sweep-sharing-throughput.md)
-  — Tier A spike, resolved YES at 256². The K-knee and tile-size
-  decision rationale lives here.
-- [`../results.md`](../results.md) — Phase 3.2 sweep-sharing section
-  has the 2D and 3D bench tables and the wafer.space-scale
-  extrapolation.
-- [ADR 0008](../adr/0008-defer-route-nets-batched.md) — original
-  sweep-sharing observation; deferred `route_nets_batched` until WS3.3.
-  When WS3.3 lands, this ADR should be amended (or superseded) to
-  reflect the actual delivered K-source architecture.
-- [ADR 0010](../adr/0010-per-axis-cost-tensors.md), [ADR 0011](../adr/0011-pdk-rules-as-structural-constraints.md)
-  — per-axis costs and PDK rules that the tile router must preserve.
+  — Tier A empirical foundation: 256² × L=5 K=100 → 4.05× speedup
+  at ~31 ms/source.
+- [ADR 0006](../adr/0006-sequential-via-relax.md) — 3D via relax
+  with per-pair via_cost amendment (commits `72de221`+`fabb0d4`).
+- [ADR 0008](../adr/0008-defer-route-nets-batched.md) — the
+  deferred conflict-detect/ripup work. The full router (item 1)
+  finally unlocks this.
+- `scripts/tile_decomp_prototype.py` — the single-tile prototype
+  that validated the substrate. Reusable as a unit-of-debug for
+  the full router (route a single tile in isolation, check
+  invariants).
 
 ## Migration note
 
-When WS3.3 lands and this handoff resolves:
+When item 1 (full tile router) lands and this handoff resolves:
 
-- Open follow-up 1 (halo width, reconciliation, multi-tile-net policy)
-  → new ADR (probably 0012) capturing the WS3.3 design decisions.
-- Open follow-up 2 (tile prototype) → mostly throwaway. Numbers from
-  it go into `docs/results.md` Phase 3.3 section.
-- Open follow-up 3 (full tile router) → marks WS3.3 shipped in
-  `docs/plans/phase3-detailed-routing.md`.
-- Open follow-up 4 (kernel optimization) → either a new ADR if
-  `torch.compile` lands, or a future-work note. Profile data already
-  captured in commit `7acfd69`; no doc migration needed.
-- Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md` in
-  the migration commit. Commit message: `docs: resolve WS3.3 handoff
-  — fold into ADR 0012 + plan + results`.
+- Open follow-up 1 → marks WS3.3 shipped in
+  [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md);
+  any new architectural decisions made during the build (e.g., halo
+  width refinement, multi-tile-spanning policy change) → ADR 0012
+  amendment.
+- Open follow-up 2 → either a new ADR if `torch.compile` lands or a
+  future-work note. Profile data already captured in commit
+  `7acfd69`; no doc migration needed.
+- Open follow-up 3 → tooling-only; commit + note in
+  `_hazard3_io.py` if the DEF-parsing helper lands.
+- Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md`
+  in the migration commit. Commit message: `docs: resolve WS3.3
+  handoff — fold into plan + ADR 0012 amendment`.
