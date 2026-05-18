@@ -15,6 +15,14 @@ on random workloads — see [`../results.md`](../results.md). Mechanism:
 reserving every pin forces early nets onto longer detours, those longer paths
 create more barriers, later nets are blocked equally.
 
+**HPWL (Half-Perimeter Wire Length):** the half-perimeter of the
+axis-aligned bounding box around a net's pins — `(rmax − rmin) +
+(cmax − cmin)`. Standard EDA proxy for net complexity: cheap to
+compute (no routing required), lower-bounds the actual routed wire
+length, monotonic in pin spread. For 2-pin nets HPWL collapses to
+the Manhattan distance between the two pins. Implementation:
+`src/gpu_pnr/ordering.py:_hpwl`.
+
 Three orderings tested on the same 256² seed-42 workload with reservation on:
 
 | nets | identity | hpwl_asc   | hpwl_desc |
