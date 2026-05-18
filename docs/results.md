@@ -600,3 +600,127 @@ slower than the 256² version even per-source. The win comes from
 - The 0.19× collapse at 3D 512² K=100 is MPS-specific — CUDA's larger
   memory bandwidth and explicit memory management would likely make
   that regime productive too, widening the architectural flexibility.
+
+# Phase 3.3 — tile decomposition partition measurement
+
+[Slice 2 of `docs/plans/ws33-tile-router-implementation.md`]: classify
+every Hazard3 net under `partition_chip` + `classify_nets` (ADR 0012 §3,
+§6) at three halo widths, with no routing, to size the multi-tile-
+spanning workload that the Slice 6 coarsened pass would have to handle.
+Source: `scripts/measure_tile_partition.py`. Fixture: the Hazard3
+LibreLane run at `~/Code/Apitronix/hazard-test`, parsed via
+`_hazard3_io.parse_guides` + `parse_def_diearea`. The net population is
+the prototype-filtered 2..20-M1-pin set (20,524 routable nets out of
+24,123 total; excluded 3,419 single-pin + 180 >20-pin).
+
+## Halo sweep (tile_size=256)
+
+| halo | tiles | nets | spanning | % | min | med | p90 | max | mean | nonempty |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16 | 1190 | 20524 | 10970 | 53.4% | 0 | 7 | 15 | 27 | 8.0 | 1119 |
+| 32 | 1190 | 20524 | 8647 | **42.1%** | 0 | 10 | 18 | 29 | 10.0 | 1124 |
+| 64 | 1190 | 20524 | 6381 | 31.1% | 0 | 12 | 19 | 29 | 11.9 | 1147 |
+| 96 | 1190 | 20524 | 5111 | 24.9% | 0 | 13 | 21 | 32 | 13.0 | 1149 |
+| 128 | 1190 | 20524 | 4399 | 21.4% | 0 | 13 | 22 | 33 | 13.6 | 1151 |
+| 192 | 1190 | 20524 | 3434 | 16.7% | 0 | 14 | 22 | 36 | 14.4 | 1155 |
+| 256 | 1190 | 20524 | 2789 | 13.6% | 0 | 15 | 23 | 39 | 14.9 | 1155 |
+
+Columns: `tiles` = total partition tiles (chip is 8823×8644 cells, so 35×34
+tile grid with partial edge tiles); `nets` = routable net count; `spanning`
+= multi-tile-spanning count (bbox+halo crosses >1 tile envelope); `min /
+med / p90 / max / mean` = per-tile net-count distribution including empty
+tiles; `nonempty` = number of tiles with ≥1 assigned net.
+
+The gate (25%) first closes at halo=96 (24.9%) and is comfortably under
+at halo=128 (21.4%). Diminishing returns past 128: 128→192 drops 4.7pp,
+192→256 drops 3.1pp. Halo widening alone is a viable amendment path
+provided the K-batch regime survives at the wider envelopes (open
+question — see Tier A spike: K=100 regressed catastrophically at 512²,
+so envelope > ~400² likely needs K dropped).
+
+## Spanning-net bbox extent (halo=32, tiles touched by bbox)
+
+How many tile *owned* regions does each spanning net's bbox intersect?
+Independent of halo; tells us how "spread out" the spanning population
+actually is.
+
+| tiles touched | nets | % of spanning |
+|---:|---:|---:|
+| 2-4 | 5257 | 60.8% |
+| 5-9 | 1510 | 17.5% |
+| 10-25 | 1038 | 12.0% |
+| 26+ | 842 | 9.7% |
+
+spanning median=4, p90=25, max=288, n=8647.
+
+**The dominant story: 78.3% of spanning nets touch ≤9 tile owned regions
+(60.8% touch ≤4). These are medium nets that exceed the halo envelope,
+not long-haul nets.** The long-haul tail (12% + 9.7% = ~21.7%, i.e. 4.1%
+of total nets) is the genuine coarsened-pass workload. Halo widening
+absorbs the rest by enlarging the envelope to fit those medium spans.
+
+## Per-tile net-count histogram (halo=32, the design point)
+
+| bucket | tiles |
+|---:|---:|
+| 0 | 66 |
+| 1-5 | 184 |
+| 6-10 | 409 |
+| 11-20 | 490 |
+| 21-50 | 41 |
+| 51-100 | 0 |
+| 100+ | 0 |
+
+## Headline
+
+**At halo=32 the spanning fraction is 42.1% (8,647 of 20,524 nets), per-tile
+median 10 nets, p90 18 nets, max 29 nets.**
+
+## Gate verdict: RED — STOP
+
+[ADR 0012 walk-back §3](adr/0012-tile-decomposition.md#walk-back-options)
+fires at >25% multi-tile-spanning fraction. **At halo=32, Hazard3
+measures 42.1%**, well past the gate. Per the Slice 2 walk-back trigger
+in [the plan](plans/ws33-tile-router-implementation.md#slice-2--hazard3-partition-measurement-multi-tile-spanning-fraction),
+the coarsened-pass design is doing too much work; the architectural
+question to resolve before Slice 6 is whether to:
+
+1. **Switch to ADR 0012 walk-back §3** — split too-big nets across adjacent
+   tiles with halo handshake instead of coarsened-pass.
+2. **Widen the halo (uniform).** Halo=96 (24.9%) just closes the gate;
+   halo=128 (21.4%) is comfortable. Memory and (likely) K-batch impact
+   need investigation: envelope grows to 448²/512², which exceeds Tier
+   A's 256² K=100 sweet spot. K probably drops to 25 or below for the
+   wider envelopes.
+3. **Adaptive per-net envelope.** Route each net through an envelope
+   sized to its bbox + margin; cap at some max envelope; nets exceeding
+   the cap go to coarsened pass. The bbox-extent histogram says ~78%
+   of spans fit a 3×3 super-tile envelope (768²) and ~91% fit 5×5
+   (1280²). Adaptive K per envelope size needed.
+
+Slice 3 onward is gated on the ADR 0012 amendment landing (an
+architect-level design decision). The measurement script (this slice's
+deliverable) is ready to land regardless of which amendment path is
+chosen.
+
+## Notes on the measurement
+
+- The 53.4% → 42.1% → 31.1% trend across halo ∈ {16, 32, 64} confirms
+  the spanning fraction is highly sensitive to halo width — the bbox+halo-
+  fits-in-envelope rule is the dominant gate, not bbox itself. The
+  prototype findings in ADR 0012 (halo=32 had 0% halo occupancy on the
+  densest M1+M2-confined tile) were consistent with "halo not exercised
+  by short nets"; this measurement is the converse view — short nets
+  fit fine, but anything with a non-trivial bbox now spans multiple tiles
+  because the envelope is only `256 + 2*32 = 320` cells wide.
+- Per-tile load is well-balanced where it exists: 1,124 of 1,190 tiles
+  carry ≥1 net at halo=32, max load is 29 nets. Once the spanning-net
+  question is resolved, the per-tile distribution itself does not
+  threaten the K=100 batched regime.
+- The prototype's "routable" filter (2..20 M1 pin cells per net) excludes
+  3,419 single-pin nets. These are guide-locked single-pin nets that
+  have nowhere to route anyway; they wouldn't survive into the router
+  regardless of the partition rule. Including them in the denominator
+  would dilute the spanning fraction to ~36% at halo=32, still red.
+- Wall-clock: 0.17 s to load the fixture, 3.81 s for three classify
+  passes. The script is pure partition + counting, no routing.
