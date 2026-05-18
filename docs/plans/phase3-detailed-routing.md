@@ -206,9 +206,10 @@ twice. WS3.3 is the right next step.
 
 ### WS3.3 — Tile decomposition
 
-**Status:** Design ADR proposed 2026-05-14
-([ADR 0012](../adr/0012-tile-decomposition.md)). Implementation
-gated on the tile prototype below.
+**Status:** [ADR 0012](../adr/0012-tile-decomposition.md) Accepted
+2026-05-14 (substrate validated by prototype, commit `26f0251`).
+Implementation in progress per
+[`ws33-tile-router-implementation.md`](ws33-tile-router-implementation.md).
 
 Splits a too-big grid (e.g., chip-scale) into overlapping tiles, routes within
 each, reconciles at halos. Unlocks **three** things:
@@ -242,14 +243,18 @@ parameters:
 - **Per-tile net assignment:** bbox+halo fits in one tile → that
   tile; else multi-tile path.
 
-**Next slice: tile prototype** (`scripts/tile_decomp_prototype.py`):
-pick a 256² × 5 sub-region of the Hazard3 chip, identify all
-multi-pin nets whose bbox+halo fits inside the tile, route them
-with `sweep_sssp_3d_multi` in K=100 batches. Measure wall-clock
-per K=100 batch (expect ~340 ms from Tier A), successful-route
-fraction, cross-net cell conflicts, and halo cell occupancy.
-Empirical anchor for halo-width refinement and reconciliation
-cost. ~2-3 hours of code.
+**Tile prototype** (`scripts/tile_decomp_prototype.py`, commit
+`26f0251`): shipped. Routed the densest 256² × 5 Hazard3 tile with
+0 cross-net conflicts; substrate validated. Findings folded into
+ADR 0012 §"Prototype findings". Prototype script is now reusable as
+a per-slice unit-of-debug for the full router build.
+
+**Next slice: full chip-scale router build.** See
+[`ws33-tile-router-implementation.md`](ws33-tile-router-implementation.md)
+— 8 PR-sized slices covering partition, K=100 batching, per-tile
+conflict ripup (unlocks [ADR 0008](../adr/0008-defer-route-nets-batched.md)),
+coarsened multi-tile-spanning pass, halo reconciliation, and
+terminal Hazard3 + 4096² gate.
 
 **Exit criteria for WS3.3:**
 
