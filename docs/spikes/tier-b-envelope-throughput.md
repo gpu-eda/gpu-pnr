@@ -173,6 +173,36 @@ mechanism explicit). The throughput-recovery question stays open as a
 future investigation; the Tier B headline implications (sequential is
 the design parameter, K-batching dead past 256²) are unchanged.
 
+### Bisect-by-worktree (2026-05-20): regression is environmental
+
+Re-ran the bench at `e5dd5be` (the exact Tier A commit, before
+`72de221`) in a worktree on today's machine. uv.lock is unchanged
+between e5dd5be and HEAD, so torch==2.11.0 in both.
+
+| K | e5dd5be mul ms/src | main mul ms/src | e5dd5be speedup | main speedup |
+|---:|---:|---:|---:|---:|
+| 1 | 50.73 | 76.43 | 1.30× | 1.17× |
+| 10 | 29.76 | 16.65 | 0.61× | 1.11× |
+| 25 | 12.33 | 13.00 | 1.45× | 1.43× |
+| 50 | 16.13 | 17.68 | 1.12× | 1.11× |
+| 100 | 14.31 | 15.48 | 1.31× | 1.33× |
+
+**Tier A's 4.05× / 31 ms/source at K=100 does not reproduce at its
+own commit on today's machine.** The numbers at e5dd5be match today's
+main to within noise. The K-batching collapse since Tier A is
+**environmental** — macOS / Apple-MPS firmware / thermal-power state
+drift between 2026-05-12 and today. Not 72de221. Not anything in
+our git history.
+
+Consequences:
+- A full revert of 72de221 will not recover Tier A's speedup — confirmed.
+- No further bisecting can recover it — there's nothing to find.
+- Tier A's headline (256² × K=100 → 4.05×) was a real measurement *at
+  the time* but is not a reproducible perf target on current MPS.
+- The amendment to ADR 0012 should treat sequential per-source as the
+  design parameter and explicitly note the K-batching erosion is not
+  a code regression.
+
 ## Logs
 
 - `/tmp/claude/tier-b-env{256,320,448,512,768}.log` (pre-fix)
