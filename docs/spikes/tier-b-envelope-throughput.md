@@ -144,13 +144,39 @@ and far simpler.
 - **CUDA.** Apple Silicon MPS only. CUDA's K-batch behavior may be
   different — likely better given memory bandwidth, but unmeasured.
 
+## Amendment (2026-05-19): tensor-indexing hypothesis disproved
+
+The original finding §2 fingered `72de221`'s tensor-indexed
+`via_costs[lyr - 1]` in the per-layer via-relax loop as the likely cause
+of the K-batching collapse (0-d-tensor scalar forces a tensor + tensor
+broadcast). A surgical fix (commit `12768ac`) materialises via_costs as
+a Python `list[float]` at call entry, restoring the tensor + scalar
+broadcast in the hot path. Re-bench at 256²:
+
+| K | pre-fix mul ms/src | post-fix mul ms/src | Δ |
+|---:|---:|---:|---:|
+| 1 | 109.20 | 76.43 | -30% |
+| 10 | 21.33 | 16.65 | -22% |
+| 25 | 13.27 | 13.00 | -2% |
+| 50 | 20.57 | 17.68 | -14% |
+| 100 | 15.73 | 15.48 | -2% |
+
+The fix is real and net-positive (small K wins, no regressions), but
+**the K-batching speedup ratio at K=25-100 did not move** — multi
+still peaks at 1.43× (was 1.46×), nowhere near Tier A's 4.05×. The
+tensor-indexed via_cost is NOT the dominant cause of the K-batching
+collapse. Some other change in MPS / PyTorch perf since Tier A is
+responsible.
+
+The fix stays in (no regression, small low-K win, makes the perf
+mechanism explicit). The throughput-recovery question stays open as a
+future investigation; the Tier B headline implications (sequential is
+the design parameter, K-batching dead past 256²) are unchanged.
+
 ## Logs
 
-- `/tmp/claude/tier-b-env256.log`
-- `/tmp/claude/tier-b-env320.log`
-- `/tmp/claude/tier-b-env448.log`
-- `/tmp/claude/tier-b-env512.log`
-- `/tmp/claude/tier-b-env768.log`
+- `/tmp/claude/tier-b-env{256,320,448,512,768}.log` (pre-fix)
+- `/tmp/claude/tier-b-env{256,448}-post-fix.log` (post-fix)
 
 ## Links
 
