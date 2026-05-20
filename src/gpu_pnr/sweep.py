@@ -414,6 +414,12 @@ def sweep_sssp_3d(
     """
     L = w.shape[0]
     via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
+    # Materialise as Python floats once; the hot-path via-relax in `step`
+    # is a tensor + scalar broadcast (fast) when `vc_f[k]` is a float, but
+    # a tensor + 0-d-tensor broadcast (slow on MPS, an extra kernel launch
+    # per layer per direction per iteration) if we index `via_costs[k]`
+    # directly. See docs/spikes/tier-b-envelope-throughput.md.
+    vc_f: list[float] = via_costs.tolist()
     d = torch.full_like(w, float("inf"))
     sl, sr, sc = source
     d[sl, sr, sc] = 0.0
@@ -445,10 +451,10 @@ def sweep_sssp_3d(
         d = _sweep_forward(d, fwd_v, axis=1)
         d = _sweep_backward(d, bwd_v, axis=1)
         for lyr in range(1, L):
-            d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + via_costs[lyr - 1])
+            d[lyr] = torch.minimum(d[lyr], d[lyr - 1] + vc_f[lyr - 1])
             d[lyr] = torch.where(mask_via[lyr], inf_scalar, d[lyr])
         for lyr in range(L - 2, -1, -1):
-            d[lyr] = torch.minimum(d[lyr], d[lyr + 1] + via_costs[lyr])
+            d[lyr] = torch.minimum(d[lyr], d[lyr + 1] + vc_f[lyr])
             d[lyr] = torch.where(mask_via[lyr], inf_scalar, d[lyr])
         return d
 
@@ -522,6 +528,9 @@ def sweep_sssp_3d_multi(
     K = len(sources)
     L, H, W = w.shape
     via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
+    # Materialise as Python floats once; see `sweep_sssp_3d` comment +
+    # docs/spikes/tier-b-envelope-throughput.md for the perf rationale.
+    vc_f: list[float] = via_costs.tolist()
     d = torch.full((K, L, H, W), float("inf"), device=w.device, dtype=w.dtype)
     for k, (sl, sr, sc) in enumerate(sources):
         d[k, sl, sr, sc] = 0.0
@@ -555,10 +564,10 @@ def sweep_sssp_3d_multi(
         d = _sweep_forward(d, fwd_v, axis=2)
         d = _sweep_backward(d, bwd_v, axis=2)
         for lyr in range(1, L):
-            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + via_costs[lyr - 1])
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + vc_f[lyr - 1])
             d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
         for lyr in range(L - 2, -1, -1):
-            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + via_costs[lyr])
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + vc_f[lyr])
             d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
         return d
 
