@@ -27,32 +27,33 @@ jobs:
   bench:
     needs: test
     runs-on: [self-hosted, metal]
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       max-parallel: 1
       matrix:
         size: [256, 448, 512]
+        device: [mps, cpu]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
       - run: uv sync --frozen
 
-      - name: Bench 3D sweep size=${{ matrix.size }}
+      - name: Bench 3D sweep size=${{ matrix.size }} device=${{ matrix.device }}
         run: |
           set -o pipefail
-          rm -f /tmp/bench-${{ matrix.size }}.log
+          rm -f /tmp/bench-${{ matrix.size }}-${{ matrix.device }}.log
           uv run python scripts/bench_sweep_sharing.py \
             --mode 3d --layers 5 --via-cost 5.0 \
-            --device mps \
+            --device ${{ matrix.device }} \
             --size ${{ matrix.size }} \
             --ks 1 10 25 50 100 \
-            2>&1 | tee /tmp/bench-${{ matrix.size }}.log
+            2>&1 | tee /tmp/bench-${{ matrix.size }}-${{ matrix.device }}.log
 
       - name: Upload bench log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: bench-${{ matrix.size }}
-          path: /tmp/bench-${{ matrix.size }}.log
+          name: bench-${{ matrix.size }}-${{ matrix.device }}
+          path: /tmp/bench-${{ matrix.size }}-${{ matrix.device }}.log
           retention-days: 90

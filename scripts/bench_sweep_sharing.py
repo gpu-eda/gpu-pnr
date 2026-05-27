@@ -35,7 +35,7 @@ def main() -> None:
     p.add_argument("--size", type=int, default=1024)
     p.add_argument("--ks", type=int, nargs="+", default=[1, 5, 10, 25, 50])
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--device", type=str, default="auto")
+    p.add_argument("--device", choices=("auto", "cpu", "mps", "cuda"), default="auto")
     p.add_argument(
         "--mode", choices=("2d", "3d"), default="2d",
         help="2d: sweep_sssp_multi; 3d: sweep_sssp_3d_multi at L layers"
