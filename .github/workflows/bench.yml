@@ -1,0 +1,58 @@
+name: Bench
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/bench_sweep_sharing.py"
+      - "pyproject.toml"
+      - "uv.lock"
+
+concurrency:
+  group: bench-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: [self-hosted, metal]
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+      - run: uv run pytest tests/ -x -q
+
+  bench:
+    needs: test
+    runs-on: [self-hosted, metal]
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        size: [256, 448, 512]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync --frozen
+
+      - name: Bench 3D sweep size=${{ matrix.size }}
+        run: |
+          set -o pipefail
+          rm -f /tmp/bench-${{ matrix.size }}.log
+          uv run python scripts/bench_sweep_sharing.py \
+            --mode 3d --layers 5 --via-cost 5.0 \
+            --device mps \
+            --size ${{ matrix.size }} \
+            --ks 1 10 25 50 100 \
+            2>&1 | tee /tmp/bench-${{ matrix.size }}.log
+
+      - name: Upload bench log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ matrix.size }}
+          path: /tmp/bench-${{ matrix.size }}.log
+          retention-days: 90
