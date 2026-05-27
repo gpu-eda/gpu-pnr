@@ -244,6 +244,142 @@ M3+ via-stacks lands).
   invalidate this ADR. Decisions here are about *substrate*, not
   attachment heuristic.
 
+## Amendment 1 (2026-05-28): guide-constrained sweep replaces fixed-tile K-batching
+
+Three findings since acceptance invalidate the original throughput model
+and motivate an architectural pivot:
+
+### Finding 1: K-batching is dead
+
+The [Tier B spike](../spikes/tier-b-envelope-throughput.md) (resolved
+2026-05-19) measured `sweep_sssp_3d_multi` at envelope sizes > 256² and
+re-measured 256². Results:
+
+- K-batching only wins at envelope=256², and only 1.46× (was 4.05× in
+  Tier A — the erosion is environmental/MPS-firmware, not code).
+- At all larger envelopes (320²+), sequential routing is faster than
+  K-batched multi.
+- Bisect-by-worktree at `e5dd5be` (exact Tier A commit) confirms: Tier
+  A's 4.05× does not reproduce on current MPS. CI golden bench on M2
+  Mac Mini also shows 0 K-batching benefit.
+
+**The §2 "K-batch size: up to 100" and the §Consequences "31 ms/net
+unit of work" are obsolete.** Sequential per-source is the design
+parameter: 18 ms/net on M4 Pro MPS, 31 ms/net on M2 MPS (CI golden),
+78–432 ms/net on CPU (size-dependent).
+
+### Finding 2: 42% multi-tile-spanning at halo=32
+
+[Slice 2 measurement](../results.md) on Hazard3 at halo=32 found 42.1%
+of routable nets span multiple tiles — well past the §Walk-back 25%
+gate. The §5 coarsened-pass would handle nearly half the nets, not the
+estimated 5–15%.
+
+### Finding 3: 65–328× search space gap vs TritonRoute
+
+The [GPU vs DRT throughput spike](../spikes/gpu-vs-drt-throughput.md)
+(2026-05-28) compared our per-net sweep cost against TritonRoute's
+detailed router on the same dualcore design:
+
+- DRT: ~1 ms/net (14 threads), ~11 ms/net single-threaded — routing
+  within guide-constrained A\* on ~1,000–5,000 grid cells per net.
+- GPU sweep: 18 ms/net MPS on full 256² × 5 grid (327,680 cells).
+- The gap is dominated by **search space**, not compute speed. We
+  sweep 65–328× more cells per net than DRT.
+
+GPU MPS is 7–13× faster than CPU on the same grid (confirmed on both
+M2 CI and M4 Pro local). The acceleration is real — but the fixed-tile
+approach wastes it on cells no net needs to visit.
+
+### Revised decision
+
+Replace the fixed 256²-tile + K-batching model with
+**guide-constrained adaptive sweep**:
+
+1. **Ingest global-routing guides** from OpenROAD GRT (or our own
+   future GR). Each net gets a set of GCell bounding boxes defining
+   its routable region.
+
+2. **Per-net sub-grid sweep.** For each net, compute the union bbox
+   of its guides + a margin (e.g., 1–2 GCells). Sweep only that
+   sub-grid, not a full 256² tile. A typical net with 2–3 guides on
+   15×15 GCells sweeps ~3,000 cells instead of 327,680.
+
+3. **Batched small-grid sweep.** Many independent per-net sub-grids
+   can be batched into a single GPU kernel call. Unlike K-batching on
+   a single large grid (which is dead per Tier B), batching many
+   *small independent grids* should parallelise well — each is
+   independent, and small grids fit in GPU cache. This is the new
+   GPU parallelism model.
+
+4. **Keep the chip-scale cost grid.** The shared `w_cur` obstacle
+   encoding (validated in the tile prototype) remains — it's how
+   cross-net conflicts propagate. The sub-grid sweep indexes into
+   the chip-scale tensor; it doesn't copy it.
+
+5. **Drop K-batching (§2).** The `sweep_sssp_3d_multi` machinery is
+   no longer the performance-critical path. Sequential per-source
+   sweep on adaptive sub-grids is both faster (smaller grid) and
+   simpler (no multi-source distance tensor).
+
+6. **Drop fixed tile assignment (§6) and halo reconciliation (§4).**
+   Guide-constrained sweep doesn't need owned/halo regions — each
+   net's search space is defined by its guides, not by a tile grid.
+   Adjacent nets don't conflict via tile boundaries; they conflict
+   via the shared `w_cur` tensor, handled by routing order and
+   rip-up.
+
+7. **Retain the coarsened-pass concept (§5) as a fallback** for nets
+   with no guides or with guides spanning too large a region to
+   sweep efficiently (>512² equivalent). These route on a coarsened
+   grid first, then refine.
+
+### Expected throughput
+
+A net with a 50×30×2 guide region (~3,000 cells): at our measured MPS
+throughput scaling, ~0.16 ms/net — ahead of DRT's 11 ms/net
+single-threaded. For Hazard3's ~20k nets at this per-net cost:
+~3.2 seconds total GPU sweep time, vs DRT's ~35s initial pass (14
+threads). Even with overhead for backtrace, conflict detection, and
+rip-up iterations, this is in the right ballpark to be competitive.
+
+On CI (M2 Mac Mini) the per-cell sweep cost is ~3× higher, so expect
+~0.5 ms/net for a 3,000-cell sub-grid — still well ahead of DRT
+single-threaded.
+
+### What survives from the original decision
+
+- §1 tile size 256² as maximum sub-grid cap (not the default)
+- §7 module structure (`tile_router.py`, API compatibility)
+- The chip-scale cost grid substrate (prototype-validated)
+- Walk-back options framework (adapted to guide-constrained context)
+
+### What is superseded
+
+- §2 K-batch size K=100 — dropped
+- §3 halo width 32 — replaced by guide margin
+- §4 halo reconciliation — not needed
+- §5 multi-tile-spanning nets as primary concern — subsumed by
+  per-net guide regions
+- §6 per-tile net assignment — replaced by per-net guide assignment
+- Throughput model: "31 ms/net K=100 batched" → "0.16–0.5 ms/net
+  guide-constrained sequential"
+
+### New risks
+
+- **Guide ingestion.** Reading OpenROAD's guide format and mapping to
+  our grid coordinates is new work. If guides are unavailable, fall
+  back to bbox-based sub-grids (net pins bbox + margin).
+- **Batched small-grid sweep kernel.** The current `sweep_sssp_3d`
+  operates on a single contiguous tensor. Batching many variable-size
+  sub-grids requires either padding to a common size or a new kernel
+  that indexes into the chip-scale tensor with per-net offsets.
+  Design TBD.
+- **Quality without guides.** If we route without GRT guides (e.g.,
+  using pin-bbox + margin), the search space is larger and quality
+  may degrade for long-haul nets. Guides are load-bearing for both
+  throughput and quality.
+
 ## Links
 
 - [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)
@@ -260,3 +396,9 @@ M3+ via-stacks lands).
   WS3.3 supersedes.
 - [`../results.md`](../results.md) — chip-scale prototype baseline
   (327 s/net) that WS3.3 must improve on.
+- [`../spikes/tier-b-envelope-throughput.md`](../spikes/tier-b-envelope-throughput.md)
+  — Tier B spike: K-batching dead past 256², sequential is the
+  design parameter (Amendment 1).
+- [`../spikes/gpu-vs-drt-throughput.md`](../spikes/gpu-vs-drt-throughput.md)
+  — GPU vs DRT comparison: 65-328× search space gap motivates
+  guide-constrained sweep (Amendment 1).
