@@ -841,3 +841,85 @@ takes `pitch_dbu` as a parameter, so it already works at either pitch.
   2000`.
 - Wall-clock: 0.24 s per run (parse + map + report). Pure geometry, no
   routing or torch.
+
+# Phase 3.3 — track-pitch sweep prototype: measured ms/net (the overhead reckoning)
+
+The size measurement above projected **0.24 ms/net median, 31 s total**
+at track pitch — but it is a *linear* `ms ∝ cells` extrapolation that
+ignores fixed per-net kernel-launch + convergence-sync overhead.
+`scripts/track_pitch_sweep_prototype.py` measures the real cost: build the
+chip-scale grid at 1120 DBU, then for a random sample of routable nets,
+map guides → `guide_region` sub-grid, slice an *independent* sub-grid, and
+route it with `route_multipin_nets_3d`. (200-net sample, seed 0, M4 Pro;
+7 over-cap nets skipped to the coarsened-pass tail.)
+
+## Headline: fixed overhead dominates — measured ≫ linear
+
+| Device | median ms/net | mean ms/net | p90 | vs 0.24 linear (median) | total, 20,524 nets |
+|---|---:|---:|---:|---:|---:|
+| CPU (M4 Pro) | **2.57** | 16.19 | 14.5 | ~11× | 332 s |
+| MPS (M4 Pro) | **16.82** | 36.66 | 76.3 | ~70× | 752 s |
+
+- **All 200/200 in-cap nets routed; 0 failures** (sub-grid median 4,332
+  cells, p90 25,254, max 162,192 — matches the size distribution).
+- The **median** is the robust statistic; the mean (and the total-seconds
+  column) is tail-sensitive — a handful of large bendy nets (max 162k
+  cells, ~0.7–1.6 s each) dominate it, so it swings ~16–42 ms/net (CPU)
+  across samples. Read the totals as order-of-magnitude.
+- The track-pitch grid *is* a real win on cells: both devices beat the
+  54 ms/net 200 DBU densest-tile baseline (ADR 0012 §Prototype findings)
+  — CPU 3.3× on the mean, MPS 1.5×. But single-stream per-net routing
+  does **not** reach the 31 s linear projection (332 s CPU / 752 s MPS).
+- **CPU is 6.5× faster than MPS at the median** (2.57 vs 16.82 ms/net).
+  A ~4k-cell sub-grid starves the GPU: each sweep is a handful of
+  `cumsum`/`cummin` kernel launches over ~114 scan lanes, and every
+  convergence check syncs — fixed launch + sync cost swamps the tiny
+  compute. The GPU's 7–13× per-cell advantage (GPU-vs-DRT spike) only
+  shows on grids large enough to amortise that overhead.
+
+**This empirically confirms the
+[slot-scale spike](spikes/slot-scale-parallelism.md) thesis:** per-net
+launch/sync overhead — not work, memory, or occupancy — is the binding
+constraint at track pitch. The batched small-grid sweep kernel (ADR 0012
+Amendment 1 §3) is the load-bearing next bet, not a micro-optimization:
+it is what claws this overhead back toward the bandwidth floor.
+
+## Pin access at track pitch (measure-first, ADR 0012 Am.3 open Q#1)
+
+The prototype quantizes every routable net's M1 pins at 200 and 1120 DBU
+and counts identity breakage. Caveat: the guide fixture gives
+GCell-granular M1 rects (16,800 DBU = 1 GCell), **not DEF pin shapes**, so
+we use rect centers as pin proxies (as the tile prototype did).
+
+| Metric | 200 DBU | 1120 DBU |
+|---|---:|---:|
+| routable nets | 20,524 | 20,524 |
+| **intra-net pin merge** (own pins collapse) | **0** | **0** |
+| cross-net contested cells | 9,908 | 9,908 |
+| nets w/ a contested pin | 20,524 | 20,524 |
+
+- **Intra-net merge is 0 at both pitches** — coarsening 200→1120 does
+  **not** collapse any net's own pins. This is the pitch-sensitive,
+  routing-relevant metric, and it clears the track-pitch move: the feared
+  pin regression does not appear for the routable population.
+- The cross-net collision count is **pitch-invariant** (two nets sharing a
+  GCell get the same rect-center cell at *any* pitch), so the alarming
+  "100% of nets share a pin cell" is a **GCell-proxy artifact**, not a
+  track-pitch effect. It re-confirms guide-rect centers are unusable as
+  real pins — a known upstream concern, orthogonal to pitch.
+- The per-net guide-constrained model routes each net on its **own**
+  sub-grid, so the shared-grid cross-net pin collision that sank 21/27
+  nets in the tile prototype **cannot occur** in this regime.
+- **True off-track pin access** (real pins not on 1120 tracks) is
+  **unmeasurable from the guide fixture** and needs DEF pin geometry. The
+  formal pin-snapping-vs-local-fine-region decision (a future ADR 0012
+  amendment) is therefore gated on DEF-driven pin extraction, not on the
+  pitch change. The pitch change itself is cleared to proceed.
+
+## Reproduce
+
+```sh
+uv run python scripts/track_pitch_sweep_prototype.py --sample 200            # MPS
+uv run python scripts/track_pitch_sweep_prototype.py --device cpu --sample 200
+uv run python scripts/track_pitch_sweep_prototype.py --pitch 200             # A/B over-sampled
+```

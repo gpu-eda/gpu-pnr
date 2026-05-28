@@ -175,8 +175,14 @@ def build_chip_grid(
     chip_xhi: int,
     chip_yhi: int,
     off_guide_cost: float = float("inf"),
+    pitch_dbu: int = PITCH_DBU,
 ) -> torch.Tensor:
     """Build a chip-scale (L, H, W) cost grid from the union of all guides.
+
+    `pitch_dbu` sets the grid sampling. Default 200 DBU is the legacy
+    over-sampled grid; pass the routing-track pitch (1120 for gf180mcuD
+    M1-M4) per ADR 0012 Amendment 3. A region sliced from `guide_region`
+    aligns cell-for-cell only when both use the same pitch.
 
     Used by the WS3.3 chip-scale router prototype. Where `build_grid` builds
     a per-net mini-grid bounded by the net's own guide bbox, this builds a
@@ -191,33 +197,39 @@ def build_chip_grid(
     committed wires as inf and cannot accidentally claim the same cell.
     """
     L = len(LAYER_ORDER)
-    H = (chip_yhi - chip_ylo) // PITCH_DBU + 1
-    W = (chip_xhi - chip_xlo) // PITCH_DBU + 1
+    H = (chip_yhi - chip_ylo) // pitch_dbu + 1
+    W = (chip_xhi - chip_xlo) // pitch_dbu + 1
     w = torch.full((L, H, W), off_guide_cost)
     for rects in all_nets.values():
         for x0, y0, x1, y1, layer in rects:
             if layer not in LAYER_ORDER:
                 continue
             lyr = LAYER_ORDER.index(layer)
-            gx0 = (x0 - chip_xlo) // PITCH_DBU
-            gy0 = (y0 - chip_ylo) // PITCH_DBU
-            gx1 = (x1 - chip_xlo) // PITCH_DBU
-            gy1 = (y1 - chip_ylo) // PITCH_DBU
+            gx0 = (x0 - chip_xlo) // pitch_dbu
+            gy0 = (y0 - chip_ylo) // pitch_dbu
+            gx1 = (x1 - chip_xlo) // pitch_dbu
+            gy1 = (y1 - chip_ylo) // pitch_dbu
             w[lyr, gy0:gy1, gx0:gx1] = 1.0
     return w
 
 
 def rect_center_to_grid(
-    rect: tuple[int, int, int, int, str], origin: tuple[int, int]
+    rect: tuple[int, int, int, int, str],
+    origin: tuple[int, int],
+    pitch_dbu: int = PITCH_DBU,
 ) -> tuple[int, int, int]:
-    """Center of a guide rectangle, mapped to (layer, row, col)."""
+    """Center of a guide rectangle, mapped to (layer, row, col).
+
+    `pitch_dbu` must match the grid the result indexes into (see
+    `build_chip_grid`).
+    """
     x0, y0, x1, y1, layer = rect
     cx = (x0 + x1) // 2
     cy = (y0 + y1) // 2
     return (
         LAYER_ORDER.index(layer),
-        (cy - origin[1]) // PITCH_DBU,
-        (cx - origin[0]) // PITCH_DBU,
+        (cy - origin[1]) // pitch_dbu,
+        (cx - origin[0]) // pitch_dbu,
     )
 
 

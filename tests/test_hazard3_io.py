@@ -21,7 +21,12 @@ from pathlib import Path
 # scripts/ isn't on sys.path under pytest by default.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
-from _hazard3_io import parse_def_nets  # noqa: E402
+from _hazard3_io import (  # noqa: E402
+    PITCH_DBU,
+    build_chip_grid,
+    parse_def_nets,
+    rect_center_to_grid,
+)
 
 
 def _write_def(tmp_path: Path, body: str) -> Path:
@@ -117,6 +122,36 @@ END NETS
 """
     nets = parse_def_nets(_write_def(tmp_path, body))
     assert nets == {"_0006_": (100, 0), "_0007_": (1000, 1)}
+
+
+def test_build_chip_grid_default_pitch_is_200():
+    """Omitting pitch_dbu reproduces the legacy 200 DBU sampling."""
+    nets = {"n0": [(0, 0, 1120, 1120, "Metal1")]}
+    default = build_chip_grid(nets, 0, 0, 11200, 11200)
+    explicit = build_chip_grid(nets, 0, 0, 11200, 11200, pitch_dbu=PITCH_DBU)
+    assert PITCH_DBU == 200
+    assert default.shape == explicit.shape
+    # H = (11200 - 0) // 200 + 1 = 57
+    assert default.shape[1] == 57 and default.shape[2] == 57
+
+
+def test_build_chip_grid_track_pitch_shrinks_axes():
+    """At the 1120 DBU track pitch the grid is ~5.6x coarser per axis."""
+    nets = {"n0": [(0, 0, 1120, 1120, "Metal1")]}
+    track = build_chip_grid(nets, 0, 0, 11200, 11200, pitch_dbu=1120)
+    # H = (11200 - 0) // 1120 + 1 = 11
+    assert track.shape[1] == 11 and track.shape[2] == 11
+    # The single guide rect occupies one track cell, not a 5x5 block.
+    assert float(track[0, 0, 0]) == 1.0
+    assert float(track[0, 1, 1]) == float("inf")
+
+
+def test_rect_center_to_grid_respects_pitch():
+    """Pin mapping coarsens with pitch; default stays at 200 DBU."""
+    rect = (1000, 2000, 1400, 2400, "Metal2")
+    # center = (1200, 2200); layer index 1.
+    assert rect_center_to_grid(rect, (0, 0)) == (1, 11, 6)
+    assert rect_center_to_grid(rect, (0, 0), pitch_dbu=1120) == (1, 1, 1)
 
 
 def test_missing_nets_section_raises(tmp_path: Path):
