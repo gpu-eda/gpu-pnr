@@ -380,6 +380,196 @@ single-threaded.
   may degrade for long-haul nets. Guides are load-bearing for both
   throughput and quality.
 
+## Amendment 2 (2026-05-28): guide-region mapper lands; bbox throughput model refuted
+
+Amendment 1 named a guide ingestion path and an expected throughput
+(~3,000 cells, ~0.16 ms/net per net). Building the mapper and measuring
+the real distribution settles two things: the **mapper conventions are
+locked** (decisions below), and the **bbox throughput model is wrong**
+(finding below).
+
+### Decisions locked: the `guide_region` mapper
+
+`src/gpu_pnr/guides.py` implements the Amendment 1 §1 ingestion path.
+`guide_region(rects, chip_origin, layer_order, pitch_dbu, *, margin,
+chip_shape)` maps a net's GRT guide rectangles to a `GuideRegion`
+sub-grid bounding box. Conventions, now fixed:
+
+1. **Half-open bounds.** A region is exactly `w_chip[l0:l1, r0:r1,
+   c0:c1]` — same slicing convention as `tile_router` and
+   `build_chip_grid`, so a region lines up cell-for-cell with the
+   chip-scale cost tensor. The half-open upper bound is "last cell any
+   guide rect touches, plus one".
+2. **Contiguous layer span.** The layer range is `[min_guide_layer,
+   max_guide_layer]` inclusive — a guide on M1+M3 yields layers
+   `[0:3]`, **including the empty M2**. Via transitions relax through
+   adjacent layers ([ADR 0006](0006-sequential-via-relax.md)); a
+   sub-grid that dropped the empty middle layer would sever the via
+   stack. Margin never widens the layer range.
+3. **Margin in grid cells, default 4.** Slack added on every side of
+   the row/col bbox (≈0.8 µm at 200 DBU pitch) for pin reach and short
+   detours just outside the guides — mirrors DRT's "small expansion
+   margin". Deliberately **not** in GCells: one GCell is 84 grid cells,
+   which would balloon a compact region.
+4. **`chip_shape` clamps** the returned region to `[0,L)×[0,H)×[0,W)`
+   so it is always a valid slice; `None` when no rect lands on a layer
+   in `layer_order`.
+
+The mapper is pure integer geometry — no torch, no PDK coupling beyond
+the caller-supplied `layer_order`. The raw `*.guide` text parser stays
+in `scripts/_hazard3_io.parse_guides` (fixture I/O).
+
+### Finding: guide-bbox sub-grids are 31× larger than estimated
+
+`scripts/measure_guide_regions.py` over the full Hazard3 fixture
+([`../results.md`](../results.md) Phase 3.3):
+
+- **Median sub-grid ~93k cells (176×176×3), not 3,000** — 31× the
+  Amendment 1 estimate. Mean 784k.
+- Guide-bbox sweep shaves only **~3.5× vs the full 256²×5 tile**, not
+  the ~100× Amendment 1 assumed, and stays **19–93× above DRT's
+  1,000–5,000 cells/net**.
+- **47.6% of nets exceed the 256² per-axis cap** — nearly half would
+  fall to the coarsened-pass fallback, not a direct sub-grid sweep.
+- Linear (optimistic) throughput: median ~5 ms/net, total ~884 s on
+  M4 Pro — vs the Amendment's 0.16 ms/net and 3.2 s.
+
+**Root cause: a guide set is a thin snake; its bounding box is the
+enclosing rectangle.** The dense-tensor sweep pays for every cell in the
+bbox, including the empty area the snake routes around. DRT searches the
+snake (guide cells only), not the rectangle. So Amendment 1 §2's
+"sweep only that sub-grid" reduces work far less than assumed, because
+"that sub-grid" is the bbox, not the guides.
+
+### Open architectural question (NOT decided here)
+
+What search space should the sweep actually visit? The bbox is a poor
+proxy; the realistic options, in increasing cost:
+
+- **(A) Accept the bbox.** Sweep the ~3.5×-reduced bbox and bank the win
+  on GPU batching of many independent sub-grids (Amendment 1 §3).
+  Simplest; but ~48% over-cap nets need the fallback, and batching is
+  dominated by large variable-size grids.
+- **(B) Per-segment (snake-following) sweep.** Decompose a multi-pin /
+  L-bending net into guide-segment-sized boxes (à la DRT's two-pin
+  Steiner segments), each ~1–2 GCells, and sweep each small box. Keeps
+  the dense kernel; shrinks the search space to near the snake. Adds a
+  decomposition + stitch step.
+- **(C) Sparse guide-cell graph.** Abandon the dense rectangular tensor
+  for a packed graph over guide cells only (à la DRT's `FlexGridGraph`).
+  Closes the search-space gap fully but is a major kernel rewrite and
+  loses the dense-sweep `cumsum`/`cummin` formulation
+  ([ADR 0002](0002-scan-based-sweeps.md)).
+
+This fork gates the sweep prototype (Amendment 1 follow-up 2) and needs a
+decision before that work starts. It likely warrants its own spike to
+measure option (B)'s decomposition overhead against (A)'s batching win.
+
+### What survives
+
+- Amendment 1's pivot away from fixed-tile K-batching stands — that was
+  driven by Tier B (K-batching dead) and the DRT search-space gap, both
+  independent of this finding.
+- The `guide_region` mapper is the ingestion primitive for all three
+  options above; none of them discard it.
+- The chip-scale shared `w_cur` cost grid (Amendment 1 §4) is unchanged.
+
+## Amendment 3 (2026-05-28): the cost grid is over-sampled 5.6× — route on the track pitch
+
+Amendment 2 found guide-bbox sub-grids 31× larger than Amendment 1's
+estimate and framed an A/B/C fork over what the sweep should visit.
+Checking the grid pitch against the PDK shows the 31× is almost entirely
+an **over-sampling artifact**, and the fork largely dissolves.
+
+### Finding: our grid pitch is 5.6× finer than the routing tracks
+
+From the Hazard3 DEF (gf180mcuD):
+
+| Quantity | Value |
+|---|---|
+| DEF units | 2000 DBU/µm |
+| Routing track pitch, M1–M4 (`TRACKS ... STEP`) | **1120 DBU = 0.56 µm** |
+| Routing track pitch, M5 | 1800 DBU = 0.9 µm |
+| GCell (`GCELLGRID ... STEP`) | 16,800 DBU = **15 tracks** |
+| Our cost-tensor pitch (`_hazard3_io.PITCH_DBU`) | **200 DBU = 0.1 µm** |
+
+The cost tensor samples at 200 DBU but wires only sit on 1120 DBU tracks
+— **5.6× finer per axis ≈ 31× more cells than there are track
+intersections**, for the same silicon. The 200 DBU value was an early
+arbitrary quantization; no ADR or comment justifies it. (Re-measuring at
+`--pitch 1120` validates this directly — see below.)
+
+### Re-measurement at track pitch validates Amendment 1
+
+`scripts/measure_guide_regions.py --pitch 1120` over the full Hazard3
+fixture ([`../results.md`](../results.md) Phase 3.3):
+
+| Metric (median net) | 200 DBU (Amendment 2) | 1120 DBU (track) | Amendment 1 estimate |
+|---|---:|---:|---:|
+| Sub-grid cells | 92,928 | **4,332** | ~3,000 |
+| ms/net (M4 Pro, linear) | 5.10 | **0.24** | 0.16 |
+| Total, 20.5k nets | 884 s | **31 s** | 3.2 s |
+| Nets over 256² cap | 47.6% | **6.3%** | "5–15%" |
+
+At track resolution the median net is 1.4× the Amendment 1 estimate (not
+31×), and the over-cap fraction lands inside the "5–15%" Amendment 1
+anticipated. **Amendment 1's throughput model was right; it was implicitly
+reasoning in tracks (15 per GCell), and the tensor was over-sampled.**
+
+### Decision direction: adopt the track-pitch grid
+
+Route on a grid sampled at the routing-track pitch, not 200 DBU. This is
+**higher-leverage and lower-risk than the A/B/C fork** and reshapes it:
+
+- The pitch fix is a `build_chip_grid` / `Pdk.pitch_dbu` change — **no
+  routing-algorithm change** — and it shrinks every net ~31×.
+- At track pitch, **option A (plain guide-bbox sweep) is viable for ~94%
+  of nets** (median 0.24 ms/net, ~31 s total single-stream on Hazard3).
+- **Options B (corridor decomposition) and C (sparse guide-cell graph)
+  become a deferred tail-optimization** for the ~6% over-cap / bendy
+  nets — not a prerequisite. Defer until a track-pitch sweep prototype
+  measures whether the tail actually hurts.
+
+### Open implementation questions (not yet decided)
+
+The pitch change is not free; these gate a clean track-pitch router:
+
+1. **Pin access.** Access points need not lie on tracks. A pure track
+   grid can miss them. DRT's answer is *off-track* grid lines near pins;
+   ours will need pin snapping or a locally-finer region around pins.
+   Risk: a coarser grid that mis-snaps pins re-introduces the
+   pin-collision failures the tile prototype already saw (§Prototype
+   findings: 21/27 failures were pin quantization on the 200 DBU grid).
+2. **Per-layer / non-uniform pitch.** M1–M4 are 1120 DBU; M5 is 1800;
+   the track origin offset is 560. A uniform tensor wants one pitch.
+   Either pick the finest (1120, over-sampling M5 ~1.6×) or carry a
+   non-uniform grid (more work, affects the `cumsum`/`cummin` axis
+   assumptions of [ADR 0002](0002-scan-based-sweeps.md)).
+3. **Via alignment.** On a track grid vias land on track intersections
+   naturally; on 200 DBU they are mis-quantized today. Re-pitching
+   should *help* via correctness, but the via-relax kernel
+   ([ADR 0006](0006-sequential-via-relax.md)) needs re-checking at the
+   new pitch.
+
+### Slot-scale implication
+
+At track pitch the approach plausibly scales to a wafer.space 1×1 slot
+(~12.9 mm², ~350k routable nets, ~9.6 B grid cells). The parallel work
+vastly exceeds what saturates an M4 Pro GPU; the limiter is per-net
+kernel-launch overhead, which the batched small-grid sweep (Amendment 1
+§3) targets. Full analysis in
+[`../spikes/slot-scale-parallelism.md`](../spikes/slot-scale-parallelism.md).
+
+### What survives / is superseded
+
+- **Survives:** the `guide_region` mapper (Amendment 2) — it takes
+  `pitch_dbu` as a parameter, so it already works at any pitch. The
+  guide-constrained pivot (Amendment 1). The chip-scale `w_cur` grid.
+- **Superseded:** Amendment 2's framing of A/B/C as a near-term fork —
+  it is now "pitch fix first, then A; B/C deferred". The implicit
+  assumption throughout ADR 0012 that the cost tensor is sampled at
+  200 DBU.
+
 ## Links
 
 - [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)

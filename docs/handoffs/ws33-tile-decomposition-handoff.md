@@ -1,7 +1,9 @@
-# Handoff — WS3.3 pivot: guide-constrained sweep replaces fixed-tile K-batching
+# Handoff — WS3.3 guide-constrained sweep: mapper landed, track-pitch finding
 
-**Created:** 2026-05-28 (replaces 2026-05-15 handoff after Tier B + DRT comparison)
-**Working tree:** clean
+**Created:** 2026-05-28 (updated after the guide-region mapper +
+track-pitch finding; supersedes the 2026-05-28 bench/DRT-comparison
+handoff)
+**Working tree:** clean (after this session's commit)
 **Branch:** main
 
 <!--
@@ -14,137 +16,141 @@ See docs/handoff-discipline.md for the migration table.
 
 ## Goal & next-up
 
-**Goal of this session:** Establish CI golden benchmarks, measure CPU vs
-MPS throughput, compare against TritonRoute DRT, and determine whether
-the fixed-tile K-batching approach from ADR 0012 is viable.
+**Goal of this session:** Implement ADR 0012 Amendment 1 follow-up 1 (the
+GRT guide-region mapper) and validate Amendment 1's throughput model on
+real Hazard3 guides.
 
-**Outcome:** K-batching is dead (confirmed on both local M4 Pro and CI
-M2). GPU sweep is 7-13× faster than CPU — but DRT is faster per-net
-because it searches 65-328× fewer cells via guide-constrained A\*.
-ADR 0012 amended to pivot toward guide-constrained adaptive sweep.
+**Outcome:** Mapper shipped (`gpu_pnr.guides.guide_region`). Measuring it
+exposed two things, both folded into ADR 0012:
+- **Amendment 2:** a guide *bounding box* is a poor search-space proxy —
+  a net's guides are a thin snake; the bbox is the enclosing rectangle.
+- **Amendment 3 (load-bearing):** our cost tensor is sampled at 200 DBU
+  but gf180mcuD routing tracks are at **1120 DBU** — 5.6×/axis (31×)
+  over-sampling. Re-measuring at track pitch *validates* Amendment 1
+  (median 4,332 cells ≈ the ~3k estimate; over-cap 48%→6%). The A/B/C
+  fork dissolves into "adopt track pitch first; plain bbox sweep
+  (option A) viable for ~94% of nets; options B/C are a deferred tail
+  optimization."
 
-**Next session should pick up:** Design and prototype the
-guide-constrained sweep — the new core of WS3.3 per ADR 0012
-Amendment 1. Concrete first step: write a GRT guide parser that reads
-OpenROAD's `*.guide` output and maps guide regions to sub-grid
-bounding boxes in our coordinate system.
+**Next session should pick up:** Prototype the **track-pitch sweep** and
+measure real ms/net (the 0.24 ms/net figure is a *linear* extrapolation;
+the actual per-net cost includes fixed kernel-launch + convergence-sync
+overhead that dominates tiny grids). Concrete first step:
+
+1. Build a chip-scale cost grid at the track pitch — `build_chip_grid`
+   with `pitch=1120` (decide per-layer: M1–M4=1120, M5=1800, origin
+   offset 560 — ADR 0012 Amendment 3 open question #2).
+2. Slice one net's `guide_region` sub-grid from it and route via
+   `route_multipin_nets_3d`; compare ms/net to the 200 DBU
+   `tile_decomp_prototype.py` baseline (54 ms/net).
+3. **Decide pin access** (Amendment 3 open question #1): off-track pins
+   on a 1120 DBU grid may mis-snap and re-introduce the pin-collision
+   failures the tile prototype saw (21/27). Pin snapping or a
+   locally-finer region around pins.
 
 **Verification command:**
 
 ```sh
 cd ~/Code/gpu-pnr && uv run pytest tests/
-# Expect: 77 passed
+# Expect: 88 passed
 
-# Confirm CI bench workflow runs
-gh run list --repo gpu-eda/gpu-pnr --limit 2
-# Expect: 2 completed Bench runs (MPS-only and MPS+CPU)
+# Guide-region mapper + measurement at both pitches
+uv run python scripts/measure_guide_regions.py --pitch 1120
+# Expect: median 4,332 cells, 6.3% over the 256² cap
 
-# Confirm ADR 0012 amendment exists
-grep "Amendment 1" docs/adr/0012-tile-decomposition.md
-# Expect: "## Amendment 1 (2026-05-28): guide-constrained sweep..."
+grep -c "Amendment 3" docs/adr/0012-tile-decomposition.md   # Expect: 1
+test -f docs/spikes/slot-scale-parallelism.md && echo ok    # Expect: ok
 ```
 
 ## Done this session
 
-| Commit | Subject | Notes |
+| Artifact | What | Notes |
 |---|---|---|
-| `ae40ec7` | ci: add bench workflow for golden GPU perf measurements | Self-hosted M2 runner, pipefail, concurrency, timeouts |
-| `abf98e5` | ci: add CPU vs MPS device matrix to bench workflow | 6-job matrix (3 sizes × 2 devices), argparse choices validation |
-| `2a79f6d` | docs: spike — GPU sweep vs TritonRoute DRT throughput comparison | Load-bearing finding: 65-328× search space gap |
-| (pending) | docs: ADR 0012 Amendment 1 + handoff | Guide-constrained sweep pivot |
+| `src/gpu_pnr/guides.py` | `GuideRegion` + `guide_region()` mapper | half-open bbox, contiguous layer span, `pitch_dbu` param, chip clamp |
+| `tests/test_guides.py` | 11 unit tests | suite 77 → 88 |
+| `scripts/measure_guide_regions.py` | Hazard3 size distribution | `--pitch` flag (200 vs 1120) |
+| ADR 0012 Amendment 2 | bbox-is-a-snake-enclosure finding | + mapper conventions locked |
+| ADR 0012 Amendment 3 | track-pitch finding (the resolution) | adopt track pitch; fork dissolved |
+| `docs/results.md` Phase 3.3 | 200-vs-1120 size distributions | the load-bearing tables |
+| `docs/spikes/slot-scale-parallelism.md` | wafer.space 1×1 slot scaling | ~350k nets, overhead-bound, batched kernel is next bet |
 
 ## Open follow-ups (priority-ordered)
 
-### 1. GRT guide parser (small-medium)
+### 1. ✅ DONE — GRT guide-region mapper
 
-Read OpenROAD's `*.guide` file format. Map guide GCell regions to
-(layer, row_start, row_end, col_start, col_end) sub-grid bounding
-boxes in our coordinate system. The Hazard3 fixture at
-`~/Code/Apitronix/hazard-test` should have guide output from
-LibreLane's GRT step.
+`gpu_pnr.guides.guide_region`. Maps a net's guide rects → grid sub-grid
+bbox. Validated on Hazard3 at both pitches.
 
-### 2. Sub-grid sweep prototype (medium)
+### 2. Track-pitch sweep prototype (medium) — **next up**
 
-Prove that sweeping a small sub-grid (e.g., 50×30×2 = 3,000 cells)
-extracted from the chip-scale cost tensor produces correct routes.
-Key questions:
-- Can we index into `w_cur` with a bbox slice without copying?
-- What's the actual ms/net at sub-grid scale on MPS?
-- Does the 0.16 ms/net estimate from the spike hold?
+See "Next session should pick up" above. Validates the 0.24 ms/net
+estimate against a real sweep at track pitch, and forces the pin-access
+decision. Produces a `docs/results.md` entry.
 
 ### 3. Batched small-grid sweep kernel (medium-large)
 
-The GPU parallelism win comes from batching many independent small
-sub-grids in one kernel call. Design options:
-- Pad all sub-grids to a common size and batch as a 4D tensor
-- Use a scatter/gather approach with per-net offset indices
-- Investigate `torch.vmap` or `torch.compile` for variable-size batching
-
-This is the hardest piece and may need its own spike.
+The load-bearing GPU-parallelism bet per
+[`slot-scale-parallelism.md`](../spikes/slot-scale-parallelism.md):
+batch K independent small sub-grids in one kernel call vs K sequential
+sweeps, at track pitch. Resolves whether per-net launch overhead (the
+slot-scale bottleneck) can be amortized. May need its own spike. Distinct
+from the dead K-batching-on-one-big-grid (Tier B).
 
 ### 4. Update WS3.3 plan (small)
 
-Revise `docs/plans/ws33-tile-router-implementation.md` to reflect the
-guide-constrained architecture. The 8-slice plan is obsolete — Slices
-1-2 shipped (tile geometry + Hazard3 measurement), Slices 3-8 need
-rewriting around the new approach.
+`docs/plans/ws33-tile-router-implementation.md` is still the obsolete
+8-slice fixed-tile plan. Rewrite around: track-pitch grid → per-net
+guide-bbox sweep (option A) → batched small-grid kernel → coarsened
+fallback for the ~6% over-cap tail.
 
-### 5. Resolve CI bench baseline question (small)
+### 5. Resolve CI bench baseline question (small, low priority)
 
-The CI M2 numbers show 0 K-batching benefit and ~3× slower than local
-M4 Pro, as expected. Consider running the bench at `e5dd5be` (Tier A
-commit) via `workflow_dispatch` with `ref: e5dd5be` to definitively
-confirm whether Tier A's 4× ever existed on M2. Low priority — the
-Tier B spike already concluded environmental regression.
+Unchanged from prior handoff — Tier B already concluded environmental
+regression; confirming Tier A's 4× on M2 at `e5dd5be` is optional.
 
 ## Critical context
 
-**ADR 0012 Amendment 1 is the load-bearing document.** It captures the
-full pivot rationale and the new design. The original ADR sections
-(§1-§7) remain for historical context but are largely superseded.
+**ADR 0012 Amendments 2 & 3 are the load-bearing docs.** Amendment 3 is
+the one that changes the plan: the over-sampled grid, not the algorithm,
+was the problem. Read it before touching the sweep.
 
-**The DRT comparison changes the success metric.** The original target
-was "22-44 min for Hazard3 on MPS." The new target is: competitive
-with DRT's 2-minute 14-threaded detailed routing on the same design.
-Guide-constrained sweep at 0.16 ms/net × 20k nets = 3.2s sweep time
-makes this plausible, but backtrace + conflict detection + rip-up
-iterations will add significant overhead.
+**The `guide_region` mapper is pitch-agnostic.** It takes `pitch_dbu` as
+a parameter, so it already works at 1120; no change needed there for the
+track-pitch prototype.
 
-**GPU acceleration is validated but the value is architectural, not
-raw speed.** GPU is 7-13× faster than CPU on the same grid (M4 Pro).
-The path to beating DRT is combining GPU speed with DRT-scale search
-spaces (guide-constrained), not brute-forcing larger grids.
+**Pin access is the real risk of the track-pitch move.** A coarser grid
+can mis-snap off-track pins. The tile prototype's 21/27 failures were pin
+quantization at 200 DBU — a 1120 DBU grid is 5.6× coarser, so this needs
+a deliberate answer (snapping or local fine region) before trusting
+routability numbers.
 
-**CI infrastructure is live.** Self-hosted M2 Mac Mini runner
-(`macos-runner-1`) at `gpu-eda` org. Bench workflow triggers on push
-to main (when src/ or scripts/bench* change) and on `workflow_dispatch`.
-Golden baselines captured in GitHub Actions artifacts.
-
-**The tile_router.py module (Slice 1) still has useful code.** The
-`partition_chip`, `net_bbox`, `classify_nets` functions and tests may
-be repurposed for guide-region partitioning. Don't delete — refactor.
+**`tile_router.py` (Slice 1) still has reusable geometry** —
+`partition_chip`, `net_bbox`, `classify_nets`. Don't delete; the
+guide-constrained router may repurpose the partition logic.
 
 ## References
 
-- [ADR 0012 Amendment 1](../adr/0012-tile-decomposition.md) — the
-  guide-constrained sweep pivot
-- [GPU vs DRT spike](../spikes/gpu-vs-drt-throughput.md) — throughput
-  comparison and DRT architecture summary
-- [Tier B spike](../spikes/tier-b-envelope-throughput.md) — K-batching
-  dead, sequential is the design parameter
+- [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–3 — the
+  guide-constrained sweep design and the track-pitch pivot.
+- [slot-scale-parallelism spike](../spikes/slot-scale-parallelism.md) —
+  wafer.space 1×1 slot scaling; batched kernel is the next bet.
+- [GPU vs DRT spike](../spikes/gpu-vs-drt-throughput.md) — search-space
+  framing and DRT baseline.
+- [`../results.md`](../results.md) Phase 3.3 — guide-region size
+  distributions (200 vs 1120 DBU).
 - [`../plans/ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md)
-  — 8-slice plan (obsolete; needs rewrite per follow-up 4)
-- [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)
-  — Phase 3 plan (WS3.3 section needs update)
+  — obsolete 8-slice plan (follow-up 4 rewrites it).
 
 ## Migration note
 
-When the guide-constrained prototype lands and this handoff resolves:
+When the track-pitch sweep prototype lands and this handoff resolves:
 
-- Follow-up 1 (guide parser) → code in `src/gpu_pnr/` + tests
-- Follow-up 2 (sub-grid prototype) → results in `docs/results.md`
-- Follow-up 3 (batched kernel) → new ADR if design is non-obvious
-- Follow-up 4 (plan rewrite) → updated `docs/plans/ws33-tile-router-implementation.md`
-- Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md`
-  in the migration commit. Commit message: `docs: resolve WS3.3
-  handoff — fold into plan + guide-constrained prototype`.
+- Follow-up 2 (track-pitch prototype) → results in `docs/results.md`;
+  pin-access decision → ADR 0012 Amendment (close open question #1/#2).
+- Follow-up 3 (batched kernel) → resolve the slot-scale spike + new ADR
+  if the design is non-obvious.
+- Follow-up 4 (plan rewrite) → updated
+  `docs/plans/ws33-tile-router-implementation.md`.
+- Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md` in the
+  migration commit: `docs: resolve WS3.3 handoff — fold into plan +
+  track-pitch prototype`.

@@ -724,3 +724,120 @@ chosen.
   would dilute the spanning fraction to ~36% at halo=32, still red.
 - Wall-clock: 0.17 s to load the fixture, 3.81 s for three classify
   passes. The script is pure partition + counting, no routing.
+
+# Phase 3.3 — guide-region sub-grid sizes (guide-constrained sweep)
+
+Measured by `scripts/measure_guide_regions.py` over the full Hazard3
+fixture (margin=4 cells), using `gpu_pnr.guides.guide_region` to map each
+net's GRT guide rectangles to a `(L,H,W)` sub-grid bounding box. This is
+the size distribution that validates ADR 0012 Amendment 1's
+guide-constrained sweep throughput model.
+
+**Two measurements, two conclusions.** At the prototype's 200 DBU grid
+the distribution appears to *refute* the model (31× too big). At the real
+1120 DBU routing-track pitch it *validates* it (1.4× the estimate). The
+gap is pure over-sampling — see "Track-pitch re-measurement" below, the
+load-bearing result that ADR 0012 Amendment 3 acts on.
+
+24,123 nets total; 3,599 excluded by the 2..20 M1-pin filter (clock /
+power / single-pin); 20,524 measured. Chip is 5×8823×8644 cells at
+200 DBU.
+
+## Per-net sub-grid dimensions (200 DBU — over-sampled grid)
+
+| Dimension | min | median | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| rows (H) | 92 | 176 | 680 | 2,276 | 4,712 |
+| cols (W) | 92 | 176 | 680 | 2,528 | 5,300 |
+| layers (L) | 2 | 3 | 3 | 5 | 5 |
+| cells (L·H·W) | 32,384 | 92,928 | 1,065,648 | 16,715,794 | 72,073,600 |
+
+## Track-pitch re-measurement (the resolution)
+
+The 200 DBU numbers above looked alarming. They are an over-sampling
+artifact: the gf180mcuD routing tracks are at **1120 DBU** (M1–M4;
+`TRACKS ... STEP` in the DEF), so the 200 DBU tensor is 5.6× finer per
+axis — 31× more cells than track intersections. Re-running at the true
+track pitch (`--pitch 1120`):
+
+| Dimension | min | median | p90 | p99 | max |
+|---|---:|---:|---:|---:|---:|
+| rows (H) | 23 | 38 | 128 | 413 | 848 |
+| cols (W) | 23 | 38 | 128 | 458 | 953 |
+| layers (L) | 2 | 3 | 3 | 5 | 5 |
+| cells (L·H·W) | 1,748 | 4,332 | 39,342 | 555,474 | 2,338,336 |
+
+| Metric (median net) | 200 DBU | **1120 DBU (track)** | Amendment 1 est. |
+|---|---:|---:|---:|
+| Sub-grid cells | 92,928 | **4,332** | ~3,000 |
+| ms/net (M4 Pro, linear) | 5.10 | **0.24** | 0.16 |
+| Total, 20,524 nets | 884 s | **31 s** | 3.2 s |
+| Over-cap fraction (>256²/axis) | 47.6% | **6.3%** | "5–15%" |
+
+At track resolution the median net is **1.4× the Amendment 1 estimate**
+(not 31×), the over-cap fraction lands inside the anticipated 5–15%, and
+the linear total (31 s, M4 Pro single-stream) is competitive with DRT's
+35 s 14-thread initial pass. **Amendment 1's model was right; the tensor
+was over-sampled.** Acted on in ADR 0012 Amendment 3 (adopt track pitch).
+
+The remainder of this section analyses the 200 DBU numbers — useful
+because the snake-vs-bbox point below is *pitch-independent* and explains
+the residual 6% over-cap tail at track pitch.
+
+## Headline (at 200 DBU): the bbox is a poor search-space proxy
+
+- **Median sub-grid is ~93k cells — 31× the Amendment's 3,000-cell
+  estimate**, mean 784k (dragged up by long snaking nets).
+- A guide bbox sweep shaves only **~3.5× vs the full 256²×5 tile**
+  (327,680 cells) at the median — not the ~100× Amendment 1 assumed.
+- Against DRT's ~1,000–5,000 cells/net, the median bbox is still
+  **19–93× larger**. Guide-*bbox* sweep does **not** close the search-
+  space gap the GPU-vs-DRT spike identified.
+- **47.6% of nets exceed the 256² per-axis cap** in H or W, so nearly
+  half would fall to the coarsened-pass fallback, not a direct sub-grid
+  sweep.
+
+Linear throughput extrapolation (`ms ∝ cells` from the 256²×5 baseline,
+18 ms/net M4 Pro MPS / 31 ms/net M2 CI — **optimistic**, ignores the
+super-linear iteration-count growth on larger grids):
+
+| Device | median ms/net | p90 ms/net | total (20,524 nets) |
+|---|---:|---:|---:|
+| M4 Pro MPS | 5.10 | 58.5 | 884 s |
+| M2 CI | 8.79 | 100.8 | 1,523 s |
+
+vs the Amendment's claimed 0.16 ms/net and 3.2 s total. The median beats
+DRT single-threaded (~11 ms/net) but the **mean (~43 ms/net) and total
+(~15 min, optimistic) do not** approach DRT's 14-thread 35 s initial pass.
+
+## Why the bbox is wrong
+
+A net's guides form a thin **snake** (a sequence of adjacent GCells from
+pin to pin); its bounding box is the enclosing rectangle, which includes
+all the empty area the snake routes *around*. The dense-tensor sweep
+processes every cell in the bbox regardless of whether it's on the
+guide. DRT instead materialises its grid graph **only inside the guide
+cells** (the snake), so it searches the snake, not the rectangle. A
+2-GCell-by-2-GCell compact net (median) is 176×176×3; a net whose pins
+are 10 GCells apart on an L-bend has a ~840×840 bbox but a guide snake of
+only ~20 GCells (~140k guide cells vs ~700k bbox cells).
+
+This snake-vs-bbox waste is **pitch-independent**: it shrinks with the
+grid but never disappears. At track pitch it is what leaves a 6% tail of
+over-cap / bendy nets. Tackling that tail (per-segment "corridor" sweep,
+ADR 0012 Amendment 2 option B) is now a *deferred tail-optimization*, not
+a prerequisite — see ADR 0012 Amendment 3. The mapper (`guide_region`)
+takes `pitch_dbu` as a parameter, so it already works at either pitch.
+
+## Notes
+
+- Margin (4 cells) is not the driver at either pitch: at 200 DBU median
+  H/W = 176 = 168 (2 GCells) + 8 (margin); the bbox size is genuinely
+  the guide extent.
+- GCell pitch is 16,800 DBU = 84 cells at 200 DBU, **15 cells at the
+  1120 DBU track pitch**; most guide rects are exactly one GCell.
+- Track pitch comes straight from the DEF: `TRACKS X 560 DO 1543 STEP
+  1120 LAYER Metal1` (M1–M4 = 1120, M5 = 1800), `UNITS DISTANCE MICRONS
+  2000`.
+- Wall-clock: 0.24 s per run (parse + map + report). Pure geometry, no
+  routing or torch.
