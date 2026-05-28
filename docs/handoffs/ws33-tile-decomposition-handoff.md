@@ -146,10 +146,11 @@ guide-constrained router may repurpose the partition logic.
 
 ## Migration note
 
-When the track-pitch sweep prototype lands and this handoff resolves:
+When the remaining follow-ups land and this handoff resolves:
 
-- Follow-up 2 (track-pitch prototype) → results in `docs/results.md`;
-  pin-access decision → ADR 0012 Amendment (close open question #1/#2).
+- Follow-up 2 (track-pitch prototype) → ✅ results already in
+  `docs/results.md` Phase 3.3. Still open: the pin-access ADR amendment
+  (close open question #1/#2), gated on DEF pin extraction.
 - Follow-up 3 (batched kernel) → resolve the slot-scale spike + new ADR
   if the design is non-obvious.
 - Follow-up 4 (plan rewrite) → updated
