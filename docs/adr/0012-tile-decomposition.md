@@ -374,7 +374,9 @@ single-threaded.
   operates on a single contiguous tensor. Batching many variable-size
   sub-grids requires either padding to a common size or a new kernel
   that indexes into the chip-scale tensor with per-net offsets.
-  Design TBD.
+  Design TBD. **→ Resolved (Amendment 4):** padding-to-common-size won;
+  `sweep_sssp_3d_batched` is built and measured 2.46–4.05× over sequential
+  on MPS. Per-net-offset indexing was not needed.
 - **Quality without guides.** If we route without GRT guides (e.g.,
   using pin-bbox + margin), the search space is larger and quality
   may degrade for long-haul nets. Guides are load-bearing for both
@@ -570,6 +572,81 @@ kernel-launch overhead, which the batched small-grid sweep (Amendment 1
   assumption throughout ADR 0012 that the cost tensor is sampled at
   200 DBU.
 
+## Amendment 4 (2026-05-29): batched small-grid sweep validated — it is the GPU parallelism model
+
+Amendment 1 §3 proposed batching K independent per-net sub-grids into one
+kernel call as the new GPU-parallelism model, but left it an **unproven
+hypothesis** ("Design TBD", §New risks). Amendment 3 then projected that at
+track pitch **option A** (plain guide-bbox sweep) was viable for ~94% of nets
+and deferred options B/C. The batched-small-grid-sweep spike
+([`../spikes/batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md))
+measures both and settles them.
+
+### Finding (full data in the spike)
+
+`sweep_sssp_3d_batched` — K independent `(K,L,H,W)` grids, one source/net,
+inf padding as walls — vs K sequential single-grid sweeps, single-source, at
+track pitch on 128 Hazard3 nets (M4 Pro):
+
+- **MPS: 2.46× (shuffled) to 4.05× (size-sorted) faster than sequential.**
+- **CPU: slower batched (0.15–0.41×)** — no kernel-launch overhead to
+  amortise, so padding + uniform iteration count only add work. The win is
+  purely GPU-overhead amortisation, which is the whole thesis.
+- Padding waste is the option-B lever: size-sorting cut waste 8.3×→3.2× and
+  lifted the win 2.46×→4.05×.
+
+### Decision
+
+1. **The batched small-grid sweep is adopted as the GPU-parallelism model**
+   for guide-constrained routing. Amendment 1 §3's hypothesis is confirmed:
+   per-net launch + convergence-sync overhead — the binding constraint the
+   track-pitch prototype found (Phase 3.3) — **is** amortisable by packing
+   many tiny independent sweeps into few kernel launches.
+
+2. **Implementation: padded stack of K independent grids.** Pad each net's
+   sub-grid to the batch's common `(L,H,W)` with `inf` (which the sweep
+   already treats as a wall), stack to `(K,L,H,W)`, one fused
+   `sweep_sssp_3d_batched`. The Amendment 1 §New-risks "per-net-offset
+   indexing into the chip tensor" alternative is **not** pursued — padding is
+   simpler and wins. (`_autotune_seg_barrier` was fixed to read the layer
+   count under the leading batch dim; see the same-PR change.)
+
+3. **Option A is the throughput path; option B (size bucketing) is a
+   validated ~1.6× deferred lever, not a prerequisite** — this confirms,
+   empirically, Amendment 3's "A now, B/C deferred" direction. Bucketing
+   becomes worthwhile when the ~1.6× matters or padding waste grows.
+
+4. **Convergence-masking is the other named lever.** The batch currently runs
+   until its *slowest* net converges (uniform iteration count); letting
+   converged nets drop out is the remaining step toward the bandwidth floor.
+   Deferred, like B.
+
+### Consequences
+
+- The guide-constrained router (`tile_router.py` successor) batches its
+  in-cap nets per sweep call; the ~6% over-cap tail still routes via the
+  coarsened-pass fallback (Amendment 1 §7). This is the throughput primitive
+  Amendment 1's whole-chip economics rest on — now empirically grounded, not
+  projected.
+- GPU beats CPU again for the *sweep step* at track-pitch grain, reversing the
+  track-pitch prototype's "CPU wins single-stream" result. On CUDA (the
+  production target, [ADR 0001](0001-pytorch-mps-host.md)) the ~10× bandwidth
+  makes batching essential just to feed the ALUs.
+- **Caveat (bounds the decision):** validated for the single-source distance
+  sweep only. A full multi-pin route adds per-net backtrace and tree growth
+  (CPU-side); their cost at batch scale, plus cross-net conflict / rip-up
+  convergence, is unmeasured. The decision is about the *sweep primitive*, not
+  the end-to-end router throughput.
+
+### What survives / is superseded
+
+- **Survives:** Amendment 3's "A now, B/C deferred" (now empirically
+  confirmed); the guide-constrained pivot (Amendment 1); the chip-scale
+  `w_cur` grid.
+- **Superseded:** Amendment 1 §New-risks "Batched small-grid sweep kernel —
+  Design TBD"; and the framing of the §3 batched sweep as an *unproven*
+  hypothesis — it is now a validated decision.
+
 ## Links
 
 - [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)
@@ -592,3 +669,7 @@ kernel-launch overhead, which the batched small-grid sweep (Amendment 1
 - [`../spikes/gpu-vs-drt-throughput.md`](../spikes/gpu-vs-drt-throughput.md)
   — GPU vs DRT comparison: 65-328× search space gap motivates
   guide-constrained sweep (Amendment 1).
+- [`../spikes/batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md)
+  — batched small-grid sweep is 2.46–4.05× over sequential on MPS;
+  validates Amendment 1 §3 and the Amendment 3 A-now/B-deferred decision
+  (Amendment 4).

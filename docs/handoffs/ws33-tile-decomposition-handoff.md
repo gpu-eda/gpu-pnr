@@ -24,7 +24,8 @@ spike).
 
 **Outcome (new spike
 [`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
-slot-scale spike's load-bearing hypothesis resolved YES):**
+slot-scale spike's load-bearing hypothesis resolved YES; decision recorded
+in ADR 0012 Amendment 4):**
 - New `sweep_sssp_3d_batched` (`src/gpu_pnr/sweep.py`): K *independent*
   per-net grids `(K,L,H,W)` in one fused call — the opposite of the dead
   Tier-B `_multi` (K sources on one *shared* grid). 4 new correctness tests.
@@ -93,8 +94,10 @@ YES: K independent sub-grids in one kernel call is **2.46–4.05× faster than
 sequential on MPS** (GPU-specific; CPU loses). Padding waste is the
 option-B lever (sorting nearly doubles the win). Folded into new spike
 [`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
-slot-scale spike's load-bearing hypothesis resolved. **Open levers:
-convergence-masking + option-B size bucketing toward the bandwidth floor.**
+slot-scale spike's load-bearing hypothesis resolved; **decision recorded in
+ADR 0012 Amendment 4** (batched sweep = the GPU-parallelism model). **Open
+levers: convergence-masking + option-B size bucketing toward the bandwidth
+floor.**
 
 ### 4. Update WS3.3 plan (small) — **next up**
 
@@ -110,7 +113,7 @@ regression; confirming Tier A's 4× on M2 at `e5dd5be` is optional.
 
 ## Critical context
 
-**ADR 0012 Amendments 2 & 3 are the load-bearing docs.** Amendment 3 is
+**ADR 0012 Amendments 2, 3 & 4 are the load-bearing docs.** Amendment 3 is
 the one that changes the plan: the over-sampled grid, not the algorithm,
 was the problem. Read it before touching the sweep.
 
@@ -152,11 +155,11 @@ When the remaining follow-ups land and this handoff resolves:
 - Follow-up 2 (track-pitch prototype) → ✅ results already in
   `docs/results.md` Phase 3.3. Still open: the pin-access ADR amendment
   (close open question #1/#2), gated on DEF pin extraction.
-- Follow-up 3 (batched kernel) → ✅ resolved into
+- Follow-up 3 (batched kernel) → ✅ resolved. Finding in
   `docs/spikes/batched-small-grid-sweep.md` + slot-scale spike status
-  update. The design (padded stack of K independent grids, mirroring
-  `_multi`) was obvious enough not to need its own ADR; the spike captures
-  the finding and the option-A/B decision lives in ADR 0012 Amendment 3.
+  update; the *decision* it settles is recorded in **ADR 0012 Amendment 4**
+  (batched small-grid sweep adopted as the GPU-parallelism model; option A
+  confirmed, B a deferred lever) — no new ADR needed, it amends 0012.
 - Follow-up 4 (plan rewrite) → updated
   `docs/plans/ws33-tile-router-implementation.md`.
 - Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md` in the
