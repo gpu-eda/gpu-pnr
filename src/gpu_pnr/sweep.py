@@ -128,7 +128,10 @@ def _autotune_seg_barrier(
         max_w_v = 0.0
     max_w_finite = max(max_w_h, max_w_v, 1.0)
     spatial_dims = w.shape[-2:]
-    layer_dim = w.shape[0] if w.ndim == 3 else 1
+    # Layers are the third-from-last axis: (L,H,W) or (K,L,H,W) when batched.
+    # Indexing from the end keeps the via term in max_legit_hint correct under
+    # the leading batch dim (`sweep_sssp_3d_batched`); 2D inputs have no layers.
+    layer_dim = w.shape[-3] if w.ndim >= 3 else 1
     if isinstance(via_cost, torch.Tensor):
         via_max = float(via_cost.max().item()) if via_cost.numel() else 0.0
     elif isinstance(via_cost, (int, float)):
@@ -569,6 +572,101 @@ def sweep_sssp_3d_multi(
         for lyr in range(L - 2, -1, -1):
             d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + vc_f[lyr])
             d[:, lyr] = torch.where(mask_via_b[:, lyr], inf_scalar, d[:, lyr])
+        return d
+
+    return _converge_or_max(d, step, max_iters, check_every)
+
+
+def sweep_sssp_3d_batched(
+    w: torch.Tensor,
+    sources: list[tuple[int, int, int]],
+    via_cost: float | Sequence[float] | torch.Tensor = 1.0,
+    max_iters: int = 200,
+    check_every: int = 8,
+    seg_barrier: float | None = None,
+    w_v: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, int]:
+    """Sweep K *independent* per-net grids in one fused kernel call.
+
+    The distinction from `sweep_sssp_3d_multi` is the whole point. `_multi`
+    batches K *sources* over a single shared `(L, H, W)` grid -- that is the
+    Tier-B K-batching that died past 256² (see
+    docs/spikes/tier-b-envelope-throughput.md). This function batches K
+    *different* `(L, H, W)` grids, one per net, each with its own source. It
+    is the guide-constrained "batched small-grid sweep" of
+    [ADR 0012](../../docs/adr/0012-tile-decomposition.md) Amendment 1 §3 and
+    the load-bearing bet of the slot-scale-parallelism spike: many tiny
+    independent sub-grid sweeps packed into few kernel launches so per-net
+    launch + convergence-sync overhead is amortised instead of paid 350k
+    times. Distance computation only -- no obstacle interaction between nets
+    (they are independent by construction; cross-net conflict is handled
+    upstream by routing order on the shared `w_cur`, not here).
+
+    Each net must already be sliced/padded to the common shape `(L, H, W)`.
+    Pad cells must be `inf` (obstacles) so they never participate. A single
+    `seg_barrier` is autotuned over the whole batch (the max over all nets),
+    so it is conservatively valid for every net's slice.
+
+    Args:
+        w: (K, L, H, W) per-net cost tensor for axis=3 ("H") moves. inf for
+            obstacles, including any padding added to reach the common shape.
+        sources: list of K (layer, row, col) source coords, one per net, each
+            in that net's own grid.
+        via_cost: scalar or length-(L-1) per-pair via costs; see
+            `sweep_sssp_3d` for the indexing convention.
+        max_iters, check_every: as in `sweep_sssp_3d`. The batch converges
+            when every net's slice has converged (slowest net bounds the call).
+        seg_barrier: optional override; otherwise autotuned from the batch.
+        w_v: optional (K, L, H, W) cost tensor for axis=1 ("V") moves.
+
+    Returns:
+        (d, iters) where d is (K, L, H, W).
+    """
+    if w.ndim != 4:
+        raise ValueError(f"w must be (K, L, H, W); got shape {tuple(w.shape)}")
+    K, L, H, W = w.shape
+    if len(sources) != K:
+        raise ValueError(
+            f"expected {K} sources (one per net), got {len(sources)}"
+        )
+    via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
+    # Materialise as Python floats once; see `sweep_sssp_3d` comment +
+    # docs/spikes/tier-b-envelope-throughput.md for the perf rationale.
+    vc_f: list[float] = via_costs.tolist()
+    d = torch.full((K, L, H, W), float("inf"), device=w.device, dtype=w.dtype)
+    for k, (sl, sr, sc) in enumerate(sources):
+        d[k, sl, sr, sc] = 0.0
+    mask_h = _obstacle_mask(w)
+    if w_v is not None:
+        mask_v = _obstacle_mask(w_v)
+        mask_via = mask_h & mask_v
+    else:
+        mask_v = mask_h
+        mask_via = mask_h
+    inf_scalar = float("inf")
+    if seg_barrier is None:
+        seg_barrier = _autotune_seg_barrier(
+            w,
+            mask_h,
+            via_cost=via_costs,
+            w_v=w_v,
+            obstacle_mask_v=mask_v if w_v is not None else None,
+        )
+    fwd_h, bwd_h = _precompute_axis(w, mask_h, axis=3, seg_barrier=seg_barrier)
+    w_for_v = w_v if w_v is not None else w
+    fwd_v, bwd_v = _precompute_axis(w_for_v, mask_v, axis=2, seg_barrier=seg_barrier)
+
+    def step(d: torch.Tensor) -> torch.Tensor:
+        d = _sweep_forward(d, fwd_h, axis=3)
+        d = _sweep_backward(d, bwd_h, axis=3)
+        d = _sweep_forward(d, fwd_v, axis=2)
+        d = _sweep_backward(d, bwd_v, axis=2)
+        for lyr in range(1, L):
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr - 1] + vc_f[lyr - 1])
+            d[:, lyr] = torch.where(mask_via[:, lyr], inf_scalar, d[:, lyr])
+        for lyr in range(L - 2, -1, -1):
+            d[:, lyr] = torch.minimum(d[:, lyr], d[:, lyr + 1] + vc_f[lyr])
+            d[:, lyr] = torch.where(mask_via[:, lyr], inf_scalar, d[:, lyr])
         return d
 
     return _converge_or_max(d, step, max_iters, check_every)

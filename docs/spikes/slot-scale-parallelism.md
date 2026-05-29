@@ -1,9 +1,13 @@
 # Spike — Slot-scale GPU parallelism for guide-constrained sweep
 
-**Status:** Open (2026-05-28). Analytical projection from the Hazard3
-track-pitch measurement — **not** an empirical run. The load-bearing
-claim (GPU batching can absorb slot-scale work) is a hypothesis the
-batched small-grid kernel must still prove.
+**Status:** Open (2026-05-28); load-bearing hypothesis **resolved YES
+2026-05-29**. Analytical projection from the Hazard3 track-pitch
+measurement — **not** an empirical run. The load-bearing claim (GPU
+batching can amortise per-net launch overhead) was the open bet; it is now
+confirmed empirically — batched small-grid sweep is 2.46–4.05× faster than
+sequential on MPS. See
+[batched-small-grid-sweep](batched-small-grid-sweep.md). The slot-scale
+*area* projection below remains analytical.
 
 ## Question
 
@@ -156,15 +160,17 @@ M4 Pro. The open question is **not** "is there enough to parallelise"
 (emphatically yes) but **"can we batch the tiny sweeps to amortise launch
 overhead and reach the bandwidth ceiling."**
 
-**Next empirical step:** prototype the batched small-grid sweep kernel
-and measure ms/net for a batch of K independent sub-grids vs K sequential
-single-grid sweeps, at track pitch. That single measurement resolves the
-load-bearing hypothesis of this spike.
+**Next empirical step — DONE (2026-05-29):** the batched small-grid sweep
+kernel was prototyped and measured — K independent sub-grids vs K sequential
+single-grid sweeps at track pitch. **Result: 2.46–4.05× faster on MPS**
+(GPU-specific; CPU loses). The load-bearing hypothesis is resolved YES; see
+[batched-small-grid-sweep](batched-small-grid-sweep.md).
 
 ## What this spike does NOT cover
 
-- **Empirical batched-kernel throughput.** This is projection only; the
-  batched small-grid kernel is unbuilt.
+- **Slot-scale batched throughput.** The batched kernel is now built and
+  measured at *Hazard3* scale ([batched-small-grid-sweep](batched-small-grid-sweep.md));
+  the *slot*-area projection above (×16.95) remains analytical.
 - **Pin access on a track grid.** Off-track pins need snapping or a
   locally-finer region (ADR 0012 Amendment 3 open question).
 - **Rip-up / conflict convergence at slot scale.** The ~5-round figure is

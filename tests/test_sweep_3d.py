@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from gpu_pnr.baseline import dijkstra_grid, dijkstra_grid_3d
 from gpu_pnr.sweep import (
+    _autotune_seg_barrier,
+    _obstacle_mask,
     axis_costs,
     backtrace_3d,
     sweep_sssp,
     sweep_sssp_3d,
+    sweep_sssp_3d_batched,
     sweep_sssp_3d_multi,
 )
 
@@ -388,6 +392,117 @@ def test_sweep_sssp_3d_multi_anisotropic_matches_per_source():
             d_multi[k].cpu()[finite.cpu()], d_single.cpu()[finite.cpu()],
             atol=5e-2,
         ), f"source {k}={s}: anisotropic K-batched diverges from single-source"
+
+
+def test_sweep_sssp_3d_batched_matches_per_grid():
+    """K *independent* per-net grids batched into one call must equal K
+    separate single-grid sweeps. Distinct from _multi (shared grid, K
+    sources): here every slice carries its own cost grid and its own source."""
+    torch.manual_seed(40)
+    K, L, H, W = 5, 3, 10, 10
+    via_cost = 0.7
+    grids = []
+    sources = []
+    for k in range(K):
+        wk = torch.rand(L, H, W) + 0.1
+        wk[k % L, (k * 3) % H, :] = math.inf  # a distinct blocked row per net
+        grids.append(wk)
+        sources.append((0, k % H, (2 * k) % W))
+    w_batch = torch.stack(grids, dim=0)
+    d_batched, _ = sweep_sssp_3d_batched(w_batch, sources, via_cost=via_cost)
+    assert d_batched.shape == (K, L, H, W)
+    for k in range(K):
+        d_single, _ = sweep_sssp_3d(grids[k], sources[k], via_cost=via_cost)
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_batched[k].cpu()[finite], d_single.cpu()[finite], atol=5e-2
+        ), f"net {k}: batched diverges from single-grid"
+        assert torch.all(torch.isinf(d_batched[k].cpu()[~finite]))
+
+
+def test_sweep_sssp_3d_batched_variable_size_padded():
+    """Nets of different sub-grid sizes pad to a common shape with inf cells;
+    each net's real region must match a single sweep on its unpadded grid, and
+    every inf pad cell must stay inf. inf padding behaves as a wall, so a
+    net's real region is bounded identically to a standalone grid."""
+    torch.manual_seed(41)
+    via_cost = 0.5
+    shapes = [(2, 6, 9), (3, 10, 4), (1, 5, 7)]
+    grids = [torch.rand(*s) + 0.1 for s in shapes]
+    sources = [(0, 0, 0), (0, 2, 3), (0, 4, 1)]
+    K = len(grids)
+    lmax = max(s[0] for s in shapes)
+    hmax = max(s[1] for s in shapes)
+    wmax = max(s[2] for s in shapes)
+    w_batch = torch.full((K, lmax, hmax, wmax), math.inf)
+    for k, g in enumerate(grids):
+        gl, gh, gw = g.shape
+        w_batch[k, :gl, :gh, :gw] = g
+    d_batched, _ = sweep_sssp_3d_batched(w_batch, sources, via_cost=via_cost)
+    for k, g in enumerate(grids):
+        gl, gh, gw = g.shape
+        d_single, _ = sweep_sssp_3d(g, sources[k], via_cost=via_cost)
+        finite = torch.isfinite(d_single)
+        got = d_batched[k, :gl, :gh, :gw].cpu()
+        assert torch.allclose(
+            got[finite], d_single.cpu()[finite], atol=5e-2
+        ), f"net {k} {tuple(g.shape)}: padded-batched diverges from unpadded"
+        assert torch.all(torch.isinf(got[~finite]))
+    # Every obstacle cell -- real obstacles AND inf padding -- stays inf.
+    obstacle = torch.isinf(w_batch)
+    assert torch.all(torch.isinf(d_batched.cpu()[obstacle.cpu()]))
+
+
+def test_sweep_sssp_3d_batched_anisotropic_matches_per_grid():
+    """Per-net anisotropy (each net its own w_v) still tracks single-grid."""
+    torch.manual_seed(42)
+    K, L, H, W = 3, 3, 9, 9
+    via_cost = 0.5
+    w_hs, w_vs, sources = [], [], []
+    for k in range(K):
+        base = torch.rand(L, H, W) + 0.1
+        w_h, w_v = axis_costs(base, [1.0, 8.0, 1.0], [8.0, 1.0, 8.0])
+        w_hs.append(w_h)
+        w_vs.append(w_v)
+        sources.append((0, k % H, (3 * k) % W))
+    w_h_batch = torch.stack(w_hs, dim=0)
+    w_v_batch = torch.stack(w_vs, dim=0)
+    d_batched, _ = sweep_sssp_3d_batched(
+        w_h_batch, sources, via_cost=via_cost, w_v=w_v_batch
+    )
+    for k in range(K):
+        d_single, _ = sweep_sssp_3d(
+            w_hs[k], sources[k], via_cost=via_cost, w_v=w_vs[k]
+        )
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_batched[k].cpu()[finite], d_single.cpu()[finite], atol=5e-2
+        ), f"net {k}: anisotropic batched diverges from single-grid"
+
+
+def test_autotune_seg_barrier_reads_layer_dim_under_batch():
+    """Regression: `_autotune_seg_barrier` must read the layer count from axis
+    -3 so a (1,L,H,W) batch yields the *same* barrier as the (L,H,W) grid it
+    wraps. The via term in max_legit_hint scales with L; collapsing L to 1
+    under the batch dim under-sizes the barrier for `sweep_sssp_3d_batched`."""
+    L, H, W = 5, 16, 16
+    w = torch.rand(L, H, W) + 0.1
+    w[2, 4:12, 7] = math.inf  # obstacles so max_seg_id > 0 (geomean branch)
+    via = 7.0
+    sb_3d = _autotune_seg_barrier(w, _obstacle_mask(w), via_cost=via)
+    w4 = w.unsqueeze(0)
+    sb_4d = _autotune_seg_barrier(w4, _obstacle_mask(w4), via_cost=via)
+    assert sb_3d == sb_4d, f"batched barrier {sb_4d} != 3D {sb_3d}"
+
+
+def test_sweep_sssp_3d_batched_rejects_bad_shape():
+    """The kernel contract: w is 4D (K,L,H,W) and len(sources) == K."""
+    w3d = torch.rand(3, 8, 8) + 0.1
+    with pytest.raises(ValueError, match="must be"):
+        sweep_sssp_3d_batched(w3d, [(0, 0, 0)])
+    w4d = torch.rand(2, 3, 8, 8) + 0.1
+    with pytest.raises(ValueError, match="one per net"):
+        sweep_sssp_3d_batched(w4d, [(0, 0, 0)])
 
 
 def test_backtrace_extra_sources_terminates_at_any_seed():

@@ -1,7 +1,8 @@
-# Handoff — WS3.3 guide-constrained sweep: track-pitch prototype measured
+# Handoff — WS3.3 guide-constrained sweep: batched small-grid kernel resolved
 
-**Created:** 2026-05-28 (updated after the track-pitch sweep prototype;
-supersedes the guide-region-mapper / track-pitch-finding handoff)
+**Created:** 2026-05-28; updated 2026-05-29 after the batched small-grid
+sweep prototype (follow-up 3 resolved). Supersedes the track-pitch-prototype
+handoff.
 **Working tree:** clean (after this session's commit)
 **Branch:** main
 
@@ -15,60 +16,60 @@ See docs/handoff-discipline.md for the migration table.
 
 ## Goal & next-up
 
-**Goal of this session:** Follow-up 2 — prototype the **track-pitch
-sweep** and measure real ms/net (the 0.24 ms/net figure was a *linear*
-extrapolation that ignores fixed kernel-launch + convergence-sync
-overhead), using a measure-first answer to the pin-access open question.
+**Goal of this session:** Follow-up 3 — prototype the **batched small-grid
+sweep kernel** and measure whether packing K *independent* sub-grids into
+one kernel call amortises the per-net launch+sync overhead the track-pitch
+prototype found binding (the load-bearing open hypothesis of the slot-scale
+spike).
 
-**Outcome (folded into `docs/results.md` Phase 3.3, "track-pitch sweep
-prototype"):**
-- Plumbed `pitch_dbu` through `build_chip_grid` + `rect_center_to_grid`
-  (`scripts/_hazard3_io.py`); both defaulted to 200 DBU. 3 new tests.
-- New `scripts/track_pitch_sweep_prototype.py` routes a sample of nets,
-  each on its own `guide_region` sub-grid sliced from a 1120 DBU chip
-  grid, via `route_multipin_nets_3d`.
-- **Measured ms/net ≫ linear.** MPS median **16.8 ms/net** (vs 0.24
-  linear, 70×); CPU median **2.57 ms/net**. CPU is **6.5× faster than
-  MPS** at this grain — tiny ~4k-cell grids are launch/sync-bound, the
-  GPU is starved. 200/200 in-cap nets routed. This **confirms the
-  slot-scale spike**: per-net overhead is the binding constraint →
-  batched small-grid kernel is the load-bearing next bet.
-- **Pin access (measure-first):** intra-net pin merge is **0 at both 200
-  and 1120 DBU** — coarsening to track pitch is cleared. The scary "100%
-  cross-net collision" is a pitch-INVARIANT GCell-proxy artifact (guides
-  are GCell-granular, not pin shapes); the per-net model avoids cross-net
-  collision structurally. The formal pin-snap-vs-fine-region ADR
-  amendment is gated on **DEF pin extraction**, not on the pitch change.
+**Outcome (new spike
+[`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
+slot-scale spike's load-bearing hypothesis resolved YES):**
+- New `sweep_sssp_3d_batched` (`src/gpu_pnr/sweep.py`): K *independent*
+  per-net grids `(K,L,H,W)` in one fused call — the opposite of the dead
+  Tier-B `_multi` (K sources on one *shared* grid). 4 new correctness tests.
+- New `scripts/batched_sweep_prototype.py` times the per-net single-source
+  sweep batched (padded stack) vs sequential, at track pitch.
+- **Batching wins on GPU: MPS 2.46× (shuffled) to 4.05× (size-sorted)
+  faster than sequential.** CPU is *slower* batched (0.15–0.41×) — no
+  launch overhead to amortise, padding only adds work. The win is purely
+  GPU-overhead amortisation, confirming the track-pitch diagnosis.
+- **Padding waste is the option-A/B lever:** sorting cut waste 8.3×→3.2×
+  and lifted the win 2.46×→4.05×. Option A (padded stack) already wins;
+  option B (bucketing) is a ~1.6× deferred gain, not a prerequisite —
+  matches ADR 0012 Amendment 3's framing.
 
-**Next session should pick up:** Follow-up 3 — the **batched small-grid
-sweep kernel** (now the load-bearing bet, empirically). Prototype batching
-K independent sub-grids in one kernel call vs K sequential single-grid
-sweeps, at track pitch; measure ms/net. See
-[`slot-scale-parallelism.md`](../spikes/slot-scale-parallelism.md). Likely
-its own spike. Then follow-up 4 (rewrite the obsolete tile plan).
+**Next session should pick up:** Follow-up 4 — **rewrite the obsolete WS3.3
+plan** (`docs/plans/ws33-tile-router-implementation.md`) around: track-pitch
+grid → per-net guide-bbox sweep (option A) → **batched small-grid kernel
+(now validated)** → coarsened fallback for the ~6% over-cap tail. Still
+open beyond that: convergence-masking + option-B bucketing as the next
+throughput levers (see the new spike's "next levers"), and the pin-access
+ADR amendment gated on DEF pin extraction.
 
 **Verification command:**
 
 ```sh
 cd ~/Code/gpu-pnr && uv run pytest tests/
-# Expect: 91 passed
+# Expect: 95 passed
 
-# Track-pitch sweep prototype (CPU is quick; default is MPS)
-uv run python scripts/track_pitch_sweep_prototype.py --device cpu --sample 100
-# Expect: 100/100 routed; intra-net merge 0 at both pitches;
-#         CPU median ~2-3 ms/net (≫ the 0.24 linear figure)
+# Batched kernel correctness + the batched-vs-sequential measurement
+uv run pytest tests/test_sweep_3d.py -k batched               # Expect: 4 passed
+uv run python scripts/batched_sweep_prototype.py --device mps --sample 128 --batch 16
+# Expect: batched ~2.5× faster than sequential (MPS); correctness Δdist 0
 
-grep -c "track-pitch sweep prototype" docs/results.md       # Expect: >=1
+grep -c "Resolved YES" docs/spikes/batched-small-grid-sweep.md  # Expect: >=1
 ```
 
 ## Done this session
 
 | Artifact | What | Notes |
 |---|---|---|
-| `scripts/_hazard3_io.py` | `pitch_dbu` param on `build_chip_grid` + `rect_center_to_grid` | default 200 (back-compat); pass 1120 for track pitch |
-| `tests/test_hazard3_io.py` | 3 new pitch tests | suite 88 → 91 |
-| `scripts/track_pitch_sweep_prototype.py` | track-pitch sweep prototype | per-net `guide_region` sub-grid route + pin-access geometry; `--pitch/--device/--sample` |
-| `docs/results.md` Phase 3.3 | "track-pitch sweep prototype: measured ms/net" | the load-bearing result — measured ≫ linear, CPU>MPS, pin-access cleared |
+| `src/gpu_pnr/sweep.py` | `sweep_sssp_3d_batched` | K independent per-net grids `(K,L,H,W)`, one source/net, batch-wide seg_barrier |
+| `tests/test_sweep_3d.py` | 4 batched correctness tests | same-size, variable-size padded, anisotropic, bad-shape; suite 91 → 95 |
+| `scripts/batched_sweep_prototype.py` | batched vs sequential sweep harness | `--device/--sample/--batch/--sort-by-size`; isolates kernel overhead (H2D + pad excluded) |
+| `docs/spikes/batched-small-grid-sweep.md` | new spike, Resolved YES | MPS 2.46–4.05× faster batched; GPU-specific; padding-waste = option-B lever |
+| `docs/spikes/slot-scale-parallelism.md` | status → hypothesis resolved | load-bearing batching claim confirmed; links new spike |
 
 ## Open follow-ups (priority-ordered)
 
@@ -85,22 +86,22 @@ pin access cleared (intra-net merge 0 at both pitches). Folded into
 `docs/results.md` Phase 3.3 "track-pitch sweep prototype". **Net result:
 single-stream is overhead-bound → follow-up 3 is the real win.**
 
-### 3. Batched small-grid sweep kernel (medium-large) — **next up**
+### 3. ✅ DONE — Batched small-grid sweep kernel
 
-The load-bearing GPU-parallelism bet, now empirically confirmed (the
-prototype showed per-net launch/sync overhead dominates single-stream;
-[`slot-scale-parallelism.md`](../spikes/slot-scale-parallelism.md)):
-batch K independent small sub-grids in one kernel call vs K sequential
-sweeps, at track pitch. Resolves whether the per-net launch overhead can
-be amortized. May need its own spike. Distinct from the dead
-K-batching-on-one-big-grid (Tier B).
+`sweep_sssp_3d_batched` + `scripts/batched_sweep_prototype.py`. Resolved
+YES: K independent sub-grids in one kernel call is **2.46–4.05× faster than
+sequential on MPS** (GPU-specific; CPU loses). Padding waste is the
+option-B lever (sorting nearly doubles the win). Folded into new spike
+[`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
+slot-scale spike's load-bearing hypothesis resolved. **Open levers:
+convergence-masking + option-B size bucketing toward the bandwidth floor.**
 
-### 4. Update WS3.3 plan (small)
+### 4. Update WS3.3 plan (small) — **next up**
 
 `docs/plans/ws33-tile-router-implementation.md` is still the obsolete
 8-slice fixed-tile plan. Rewrite around: track-pitch grid → per-net
-guide-bbox sweep (option A) → batched small-grid kernel → coarsened
-fallback for the ~6% over-cap tail.
+guide-bbox sweep (option A) → **batched small-grid kernel (now validated,
+2.46–4.05× on MPS)** → coarsened fallback for the ~6% over-cap tail.
 
 ### 5. Resolve CI bench baseline question (small, low priority)
 
@@ -151,8 +152,11 @@ When the remaining follow-ups land and this handoff resolves:
 - Follow-up 2 (track-pitch prototype) → ✅ results already in
   `docs/results.md` Phase 3.3. Still open: the pin-access ADR amendment
   (close open question #1/#2), gated on DEF pin extraction.
-- Follow-up 3 (batched kernel) → resolve the slot-scale spike + new ADR
-  if the design is non-obvious.
+- Follow-up 3 (batched kernel) → ✅ resolved into
+  `docs/spikes/batched-small-grid-sweep.md` + slot-scale spike status
+  update. The design (padded stack of K independent grids, mirroring
+  `_multi`) was obvious enough not to need its own ADR; the spike captures
+  the finding and the option-A/B decision lives in ADR 0012 Amendment 3.
 - Follow-up 4 (plan rewrite) → updated
   `docs/plans/ws33-tile-router-implementation.md`.
 - Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md` in the
