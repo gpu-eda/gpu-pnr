@@ -40,13 +40,14 @@ in ADR 0012 Amendment 4):**
   option B (bucketing) is a ~1.6× deferred gain, not a prerequisite —
   matches ADR 0012 Amendment 3's framing.
 
-**Next session should pick up:** Follow-up 4 — **rewrite the obsolete WS3.3
-plan** (`docs/plans/ws33-tile-router-implementation.md`) around: track-pitch
-grid → per-net guide-bbox sweep (option A) → **batched small-grid kernel
-(now validated)** → coarsened fallback for the ~6% over-cap tail. Still
-open beyond that: convergence-masking + option-B bucketing as the next
-throughput levers (see the new spike's "next levers"), and the pin-access
-ADR amendment gated on DEF pin extraction.
+**Next session should pick up:** Begin **GuideRouter Slice 1** per the
+rewritten [`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md)
+— but first resolve the plan's 2 open questions (multi-pin batching strategy;
+module rename). Remaining loose ends, both optional/blocked: follow-up 5 (CI
+bench baseline — optional, prior-concluded) and the pin-access ADR amendment
+(blocked on DEF pin extraction; already captured in ADR 0012 Am.3 open Q#1).
+Deferred throughput levers (convergence-masking, option-B bucketing) live in
+the new spike's "next levers".
 
 **Verification command:**
 
@@ -99,12 +100,15 @@ ADR 0012 Amendment 4** (batched sweep = the GPU-parallelism model). **Open
 levers: convergence-masking + option-B size bucketing toward the bandwidth
 floor.**
 
-### 4. Update WS3.3 plan (small) — **next up**
+### 4. ✅ DONE — Rewrite WS3.3 plan
 
-`docs/plans/ws33-tile-router-implementation.md` is still the obsolete
-8-slice fixed-tile plan. Rewrite around: track-pitch grid → per-net
-guide-bbox sweep (option A) → **batched small-grid kernel (now validated,
-2.46–4.05× on MPS)** → coarsened fallback for the ~6% over-cap tail.
+`docs/plans/ws33-tile-router-implementation.md` rewritten around the
+guide-constrained architecture: 6 slices (GuideRouter skeleton → single-stream
+baseline → batched routing → conflict/ripup → coarsened tail → Hazard3 +
+4096² gate). Parent `phase3-detailed-routing.md` §WS3.3 summary + exit
+criteria updated to match (dropped tile/halo wording). The plan carries 2
+**open questions** to confirm before the relevant slice: multi-pin batching
+strategy (Slice 3) and `tile_router.py`→`guide_router.py` rename (Slice 1).
 
 ### 5. Resolve CI bench baseline question (small, low priority)
 
