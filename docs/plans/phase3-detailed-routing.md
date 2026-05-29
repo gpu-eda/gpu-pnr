@@ -204,63 +204,64 @@ twice. WS3.3 is the right next step.
       Conclusion: per-pair is structurally correct; the via-ratio
       gap is topology, deferred to WS3.3.
 
-### WS3.3 — Tile decomposition
+### WS3.3 — Guide-constrained sweep (was: tile decomposition)
 
 **Status:** [ADR 0012](../adr/0012-tile-decomposition.md) Accepted
-2026-05-14 (substrate validated by prototype, commit `26f0251`).
-Implementation in progress per
-[`ws33-tile-router-implementation.md`](ws33-tile-router-implementation.md).
+2026-05-14, then **pivoted by Amendments 1–4** (2026-05-28/29): the
+fixed-tile + K=100 + halo design is dead; the model is now
+guide-constrained per-net sub-grids on the track pitch, parallelised by
+the batched small-grid sweep. Implementation per
+[`ws33-tile-router-implementation.md`](ws33-tile-router-implementation.md)
+(rewritten 2026-05-29 around the new architecture).
 
-Splits a too-big grid (e.g., chip-scale) into overlapping tiles, routes within
-each, reconciles at halos. Unlocks **three** things:
+Routes each net on a sub-grid sized to its **GR guides** (not a fixed tile),
+sampled at the **routing-track pitch**, indexing into one shared chip-scale
+cost tensor. Unlocks **three** things:
 
 1. Whole-chip integration (cells beyond the float32 precision wall — see
    [ADR 0005](../adr/0005-mask-based-segmented-scan.md) walk-back).
-2. The multi-source kernel's 4.05× regime per 3D 256² tile (now
-   empirically measured for the 3D kernel —
-   [`../spikes/tier-a-sweep-sharing-throughput.md`](../spikes/tier-a-sweep-sharing-throughput.md)),
-   enabling [`route_nets_batched`](../adr/0008-defer-route-nets-batched.md) on top.
-3. **Naturally subsumes "guide as soft preference"** — once we route on a
-   single global cost tensor instead of per-net mini-grids, GR allocation
-   becomes advisory because every cell already exists in the grid. Closes
-   the small-net-cohort gap that m1_penalty/pin-only couldn't reach
-   (see [`../results.md`](../results.md) Phase 3.2 investigation,
-   Finding 4).
+2. **GPU parallelism via the batched small-grid sweep** — K *independent*
+   per-net sub-grids in one kernel call, measured **2.46–4.05× over
+   sequential on MPS** ([`../spikes/batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md),
+   ADR 0012 Amendment 4). (Supersedes the dead Tier-A/B K=100-on-one-grid
+   regime.)
+3. **Naturally subsumes "guide as soft preference"** — routing on a single
+   global cost tensor instead of per-net mini-grids makes GR allocation
+   advisory; every cell already exists in the grid. Closes the
+   small-net-cohort gap m1_penalty/pin-only couldn't reach
+   ([`../results.md`](../results.md) Phase 3.2, Finding 4).
 
-Design captured in [ADR 0012](../adr/0012-tile-decomposition.md). Key
-parameters:
+Design captured in [ADR 0012](../adr/0012-tile-decomposition.md) as amended.
+Key parameters:
 
-- **Tile size:** 256² × L=5 (locked from Tier A).
-- **K-batch size:** up to 100 sources per multi-source call (locked from
-  Tier A; productive range K=25–100).
-- **Halo width:** 32 cells (initial — to be refined by the tile prototype
-  below).
-- **Halo reconciliation:** iterative re-sweep within halo region with
-  both tiles' committed routes visible (option a). Walk-back to global
-  second pass on a coarsened grid if halo cost dominates.
-- **Multi-tile-spanning nets:** global coarsened-grid first pass
-  (estimated 5–15% of nets per the handoff's Hazard3 analysis).
-- **Per-tile net assignment:** bbox+halo fits in one tile → that
-  tile; else multi-tile path.
+- **Grid pitch:** 1120 DBU = gf180mcuD M1–M4 routing-track pitch
+  (Amendment 3), not the old 200 DBU.
+- **Per-net search space:** the net's `guide_region` bbox + margin (option
+  A), capped at 256² per axis (Amendment 1 §1 as max, not default).
+- **Parallelism:** batched small-grid sweep over K independent sub-grids
+  (Amendment 4); option-B size bucketing + convergence-masking deferred.
+- **Over-cap / no-guide tail (~6%):** coarsened-grid fallback pass
+  (Amendment 3 reframes the old multi-tile-spanning pass as this tail).
+- **Cross-net conflict:** routing order on the shared `w_cur` + rip-up
+  (no tiles, no halo reconciliation — Amendment 1 §6).
 
-**Tile prototype** (`scripts/tile_decomp_prototype.py`, commit
-`26f0251`): shipped. Routed the densest 256² × 5 Hazard3 tile with
-0 cross-net conflicts; substrate validated. Findings folded into
-ADR 0012 §"Prototype findings". Prototype script is now reusable as
-a per-slice unit-of-debug for the full router build.
+**Prototypes shipped:** `scripts/tile_decomp_prototype.py` (substrate,
+commit `26f0251`), `scripts/track_pitch_sweep_prototype.py` (single-stream
+overhead-bound), `scripts/batched_sweep_prototype.py` (batched win). All
+reusable as per-slice units-of-debug.
 
-**Next slice: full chip-scale router build.** See
+**Next slice: guide-constrained router build.** See
 [`ws33-tile-router-implementation.md`](ws33-tile-router-implementation.md)
-— 8 PR-sized slices covering partition, K=100 batching, per-tile
-conflict ripup (unlocks [ADR 0008](../adr/0008-defer-route-nets-batched.md)),
-coarsened multi-tile-spanning pass, halo reconciliation, and
+— 6 PR-sized slices: `GuideRouter` skeleton + sub-grid classification →
+single-stream baseline → batched routing → conflict detect/ripup (unlocks
+[ADR 0008](../adr/0008-defer-route-nets-batched.md)) → coarsened tail →
 terminal Hazard3 + 4096² gate.
 
 **Exit criteria for WS3.3:**
 
-- [ ] A 4096² grid is routed by tile-decomposition with no quality regression
-      vs un-tiled at the same scale (4096² being the current correctness
-      ceiling, see ADR 0005).
+- [ ] A 4096² grid is routed by guide-constrained sweep with no quality
+      regression vs the un-batched `route_multipin_nets_3d` baseline at the
+      same scale (4096² being the current correctness ceiling, see ADR 0005).
 - [ ] Whole-chip integration on Hazard3 produces results competitive with
       TritonRoute (within 1.2× wire, within 1.2× vias).
 
@@ -269,7 +270,7 @@ terminal Hazard3 + 4096² gate.
 When all of these are true, this plan closes and a Phase 4 plan opens:
 
 - [ ] WS3.2 fully shipped (preferred direction, multi-pin, per-via-pair).
-- [ ] WS3.3 fully shipped (tile decomposition + whole-chip integration).
+- [ ] WS3.3 fully shipped (guide-constrained sweep + whole-chip integration).
 - [ ] Updated TritonRoute comparison numbers documented in
       [`../results.md`](../results.md).
 - [ ] Phase 4 sketches (DRC kernel co-iteration, CUDA port) promoted to a
