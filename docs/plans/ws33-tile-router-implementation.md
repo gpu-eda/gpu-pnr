@@ -1,6 +1,6 @@
 # Plan — WS3.3 guide-constrained router implementation
 
-**Status:** Proposed (2026-05-29). Supersedes the 8-slice fixed-tile +
+**Status:** Active (2026-06-01; Slice 1 landed). Supersedes the 8-slice fixed-tile +
 K=100 + halo plan (in `git log` before this date), which
 [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–4 invalidated.
 
@@ -75,12 +75,13 @@ it never restates design choices.
 
 ## Module note
 
-The router replaces the tile machinery in `src/gpu_pnr/tile_router.py`. Most
-of that module (`Tile`, `partition_chip`, `assign_net_to_tile`,
-`classify_nets`) is tile-specific and dies with the fixed-tile model;
-`net_bbox` survives as the no-guide fallback region. **Open question (Slice
-1):** rename the module to `guide_router.py` (clearer) vs keep the
-ADR-0012-§7 `tile_router.py` name. Leaning rename.
+**Done (Slice 1):** the router lives in `src/gpu_pnr/guide_router.py`. The
+tile machinery (`Tile`, `partition_chip`, `assign_net_to_tile`, tile
+`classify_nets`, `TileRouter`) was deleted with `tile_router.py`; only
+`net_bbox` survived (no-guide fallback + HPWL source). The dead fixed-tile
+measurement `scripts/measure_tile_partition.py` was removed (its result is in
+ADR 0012 Am.1 Finding 2). This supersedes ADR 0012 §7's "module structure:
+`tile_router.py`" — already superseded in spirit by Amendment 1.
 
 ---
 
@@ -96,27 +97,22 @@ load-bearing measurements, landed before the terminal integration.
 
 ---
 
-### Slice 1 — `GuideRouter` skeleton + per-net sub-grid classification
+### Slice 1 — `GuideRouter` skeleton + per-net sub-grid classification ✅ DONE
 
-**Deliverable:** `GuideRouter` class + the per-net region assignment — no
-routing yet. API mirrors `route_multipin_nets_3d`: takes
-`nets: list[list[(l,r,c)]]` + guides, returns `list[MultiPin3DResult]` in
-input order.
+**Landed** in `src/gpu_pnr/guide_router.py` + `tests/test_guide_router.py`
+(11 tests; suite 96 → 99). `GuideRouter` mirrors `route_multipin_nets_3d`
+plus per-net guides; `route` is a `NotImplementedError` stub.
 
-**Sketch:**
-- For each net: `guide_region(...)` → sub-grid bbox. No-guide nets fall back
-  to `net_bbox(pins)` + margin.
-- Classify **in-cap** (both axes ≤ 256, ADR 0012 §1 max sub-grid) vs
-  **over-cap / no-guide** (→ coarsened tail, Slice 5).
-- HPWL-ascending order ([ADR 0007](../adr/0007-hpwl-ascending-net-ordering.md)).
-- `GuideRouter.route` raises `NotImplementedError`.
-
-**Tests** (`tests/test_guide_router.py`):
-- in-cap vs over-cap classification on synthetic guides.
-- no-guide net falls back to pin-bbox region; region contains all pins.
-- every net lands in exactly one of {in-cap, tail}.
-
-**Exit:** new test file passes; full suite green.
+- `NetPlan` (index, pins, region, has_guide, in_cap) is the per-net work-item.
+- `classify_nets` builds each net's region (`guide_region`, or `net_bbox`+
+  margin fallback) and partitions into **in-cap** (guided + both row/col axes
+  ≤ `axis_cap`=256) vs **tail** (over-cap *or* no-guide; `has_guide` retained
+  so Slice 5 can re-split). In-cap is returned HPWL-ascending
+  ([ADR 0007](../adr/0007-hpwl-ascending-net-ordering.md)).
+- The chip-clamp logic was factored into `guides.clamp_region_bounds`, shared
+  with `guide_region` (one home for the clamp semantics).
+- Pin-in-region containment (the prototype's `off_region` check) is deferred
+  to Slice 2 — not a classification criterion.
 
 ---
 
@@ -275,8 +271,9 @@ When Slice 6 ships:
    [`../spikes/multi-pin-batching-strategy.md`](../spikes/multi-pin-batching-strategy.md).
    Data: 2-pin nets carry only 8.8% of Hazard3 sweep-work; ≥3-pin nets carry
    91.2%. Slice 3 implements round-batching with per-net `extra_sources`.
-2. **Module rename** (Slice 1): `tile_router.py` → `guide_router.py`?
-   Leaning rename; touches ADR 0012 §7's "module structure" line.
+2. ~~**Module rename** (Slice 1)~~ — **Resolved (2026-06-01)**: renamed to
+   `guide_router.py`; `tile_router.py` deleted. Supersedes ADR 0012 §7's
+   "module structure" line.
 
 ## References
 

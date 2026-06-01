@@ -1,8 +1,13 @@
 #!/usr/bin/env python3
 """WS3.3 tile-decomposition prototype: route one 256² × 5 Hazard3 tile.
 
-Validates the ADR 0012 design on a single tile before building the full
-chip-scale tile manager (`src/gpu_pnr/tile_router.py`):
+SUPERSEDED (2026-06-01): the fixed-tile model this validated is dead
+(ADR 0012 Amendments 1–4 → guide-constrained sweep, `gpu_pnr.guide_router`).
+This script is retained only as a substrate-validation record and because
+live scripts import its `_net_chip_pins` helper.
+
+Validated the ADR 0012 (original) design on a single tile before building
+the chip-scale tile manager (since replaced by `gpu_pnr.guide_router`):
 
   1. Tile substrate works: nets sharing one cost grid produce 0 cross-net
      cell conflicts.

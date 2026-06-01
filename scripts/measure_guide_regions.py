@@ -35,7 +35,7 @@ import time
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-# Reuse the fixture I/O helpers (same pattern as measure_tile_partition.py).
+# Reuse the fixture I/O helpers (same pattern as the other measure_*.py scripts).
 from _hazard3_io import (
     FINAL_DEF,
     GUIDE,

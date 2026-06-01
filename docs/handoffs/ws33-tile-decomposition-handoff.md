@@ -40,14 +40,17 @@ in ADR 0012 Amendment 4):**
   option B (bucketing) is a ~1.6× deferred gain, not a prerequisite —
   matches ADR 0012 Amendment 3's framing.
 
-**Next session should pick up:** Begin **GuideRouter Slice 1** per the
-rewritten [`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md)
-— but first resolve the plan's 2 open questions (multi-pin batching strategy;
-module rename). Remaining loose ends, both optional/blocked: follow-up 5 (CI
-bench baseline — optional, prior-concluded) and the pin-access ADR amendment
-(blocked on DEF pin extraction; already captured in ADR 0012 Am.3 open Q#1).
-Deferred throughput levers (convergence-masking, option-B bucketing) live in
-the new spike's "next levers".
+**Next session should pick up:** **GuideRouter Slice 2** (single-stream
+guide-constrained route on the shared `w_cur`) per
+[`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md).
+Slice 1 landed (`gpu_pnr.guide_router`: `GuideRouter` + `classify_nets`,
+in-cap/tail split, HPWL order; `route` is a stub). Both plan open questions
+are now resolved (multi-pin batching = round-batching; module renamed to
+`guide_router.py`). Remaining loose ends, both optional/blocked: follow-up 5
+(CI bench baseline — optional, prior-concluded) and the pin-access ADR
+amendment (blocked on DEF pin extraction; ADR 0012 Am.3 open Q#1). Deferred
+throughput levers (convergence-masking, option-B bucketing) live in the
+batched-small-grid-sweep spike's "next levers".
 
 **Verification command:**
 

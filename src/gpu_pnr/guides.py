@@ -13,7 +13,7 @@ The raw `*.guide` text parser lives in `scripts/_hazard3_io.parse_guides`
 integer geometry — no torch, no PDK coupling beyond a `layer_order`
 lookup the caller supplies.
 
-Coordinate conventions (consistent with `tile_router` and
+Coordinate conventions (consistent with `guide_router` and
 `scripts/_hazard3_io`):
   - Guide rects are `(xlo, ylo, xhi, yhi, layer_name)` in DEF DBU,
     axis-aligned, `xlo < xhi` and `ylo < yhi`.
@@ -90,6 +90,28 @@ class GuideRegion:
         """
         lyr, r, c = cell
         return (lyr - self.l0, r - self.r0, c - self.c0)
+
+
+def clamp_region_bounds(
+    l0: int, l1: int, r0: int, r1: int, c0: int, c1: int,
+    chip_shape: tuple[int, int, int],
+) -> tuple[int, int, int, int, int, int]:
+    """Clamp half-open region bounds to `[0,L) × [0,H) × [0,W)`.
+
+    Each lower bound is clamped into `[0, dim]`; each upper bound is then
+    clamped into `[lower, dim]` so the result is always a valid (possibly
+    empty) slice with `lower <= upper`. Shared by `guide_region` and the
+    pin-bbox fallback in `guide_router` so the clamp semantics live in one
+    place.
+    """
+    chip_l, chip_h, chip_w = chip_shape
+    l0 = max(0, min(l0, chip_l))
+    l1 = max(l0, min(l1, chip_l))
+    r0 = max(0, min(r0, chip_h))
+    r1 = max(r0, min(r1, chip_h))
+    c0 = max(0, min(c0, chip_w))
+    c1 = max(c0, min(c1, chip_w))
+    return l0, l1, r0, r1, c0, c1
 
 
 def guide_region(
@@ -178,12 +200,8 @@ def guide_region(
     l1 = l_max + 1
 
     if chip_shape is not None:
-        chip_l, chip_h, chip_w = chip_shape
-        l0 = max(0, min(l0, chip_l))
-        l1 = max(l0, min(l1, chip_l))
-        r0 = max(0, min(r0, chip_h))
-        r1 = max(r0, min(r1, chip_h))
-        c0 = max(0, min(c0, chip_w))
-        c1 = max(c0, min(c1, chip_w))
+        l0, l1, r0, r1, c0, c1 = clamp_region_bounds(
+            l0, l1, r0, r1, c0, c1, chip_shape
+        )
 
     return GuideRegion(l0=l0, l1=l1, r0=r0, r1=r1, c0=c0, c1=c1)
