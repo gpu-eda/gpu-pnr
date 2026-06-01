@@ -923,3 +923,41 @@ uv run python scripts/track_pitch_sweep_prototype.py --sample 200            # M
 uv run python scripts/track_pitch_sweep_prototype.py --device cpu --sample 200
 uv run python scripts/track_pitch_sweep_prototype.py --pitch 200             # A/B over-sampled
 ```
+
+# Phase 3.3 — GuideRouter Slice 2: single-stream shared-grid routing
+
+The track-pitch prototype above routes each net on an *independent* clone, so
+it can't surface cross-net conflicts. Slice 2 of the guide-constrained router
+(`gpu_pnr.guide_router.GuideRouter`) routes the sampled nets sequentially on
+**one shared** chip cost grid in HPWL-ascending order: each routed net's cells
+become `inf`, so later nets see them as obstacles. `scripts/guide_router_hazard3.py`
+validates it (100-net sample, seed 0, track pitch, pin-access rules injected via
+the router's `prep_subgrid` hook).
+
+| Device | routed (in-cap) | cross-net conflicts | ms/net (aggregate mean) |
+|---|---|---:|---:|
+| CPU (M4 Pro) | 95 / 99 | **0** | 16.5 |
+| MPS (M4 Pro) | 95 / 99 | **0** | 43.0 |
+
+- **0 cross-net conflicts on both devices** — the substrate invariant holds: the
+  shared-`w_cur` commit propagates obstacles across nets exactly (what the tile
+  prototype first showed, now on the guide-constrained shared grid).
+- **Routability 96%, not 100%** — honest cross-net contention. The 4 nets that
+  fail have no detour around earlier-committed cells; the prototype's 100% came
+  from independent clones with no shared obstacles. Rip-up (Slice 4) recovers
+  these by re-ordering. (The earlier reading is documented in the commit: a
+  first cut "routed" 99/99 with 4 conflicts because the per-net pin-access prep
+  resurrected committed cells — fixed with a committed-cell re-block.)
+- **ms/net matches the prototype's MEAN** (CPU 16.5 vs 16.2; MPS 43 vs 37 — the
+  remaining MPS gap is the per-net sub-grid clone + pin-access prep). The
+  aggregate is `total / in-cap count`, comparable to the prototype's mean, not
+  its tail-light 2.6/16.8 medians. CPU again beats MPS at this grain
+  (overhead-bound, as the track-pitch prototype found) — the batched Slice 3 is
+  the fix.
+
+## Reproduce (Slice 2)
+
+```sh
+uv run python scripts/guide_router_hazard3.py --device cpu --sample 100
+uv run python scripts/guide_router_hazard3.py --device mps --sample 100
+```

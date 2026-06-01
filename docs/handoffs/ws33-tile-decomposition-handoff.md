@@ -40,17 +40,21 @@ in ADR 0012 Amendment 4):**
   option B (bucketing) is a ~1.6× deferred gain, not a prerequisite —
   matches ADR 0012 Amendment 3's framing.
 
-**Next session should pick up:** **GuideRouter Slice 2** (single-stream
-guide-constrained route on the shared `w_cur`) per
+**Next session should pick up:** **GuideRouter Slice 3** (batched routing via
+`sweep_sssp_3d_batched`, round-batching multi-pin nets per the resolved
+strategy) per
 [`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md).
-Slice 1 landed (`gpu_pnr.guide_router`: `GuideRouter` + `classify_nets`,
-in-cap/tail split, HPWL order; `route` is a stub). Both plan open questions
-are now resolved (multi-pin batching = round-batching; module renamed to
-`guide_router.py`). Remaining loose ends, both optional/blocked: follow-up 5
-(CI bench baseline — optional, prior-concluded) and the pin-access ADR
-amendment (blocked on DEF pin extraction; ADR 0012 Am.3 open Q#1). Deferred
-throughput levers (convergence-masking, option-B bucketing) live in the
-batched-small-grid-sweep spike's "next levers".
+Slices 1–2 landed: `gpu_pnr.guide_router` has `classify_nets` (in-cap/tail)
+and single-stream `route` on the shared `w_cur` — Hazard3-validated at 0
+cross-net conflicts (CPU+MPS), 96% routed (rip-up = Slice 4 recovers the rest).
+Slice 3 watch-outs from Slice 2: (a) the `prep_subgrid` hook is per-sub-grid —
+batched path applies it per-net before padding/stacking; (b) the `committed`
+bool-mask re-block after prep must carry into the batched path (and Slice 4
+rip-up must clear those bits). Carried cleanup: consolidate the duplicated
+net-sampling loop + Hazard3 constants into `_hazard3_io.py`. Loose ends
+(optional/blocked): follow-up 5 (CI bench baseline) and the pin-access ADR
+amendment (blocked on DEF pin extraction, ADR 0012 Am.3 open Q#1). Deferred
+levers (convergence-masking, option-B bucketing) in the batched-sweep spike.
 
 **Verification command:**
 

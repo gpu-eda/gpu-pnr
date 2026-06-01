@@ -11,6 +11,7 @@ pivot, Amendments 1–4).
 from __future__ import annotations
 
 import pytest
+import torch
 
 from gpu_pnr.guide_router import (
     GuideRouter,
@@ -18,6 +19,8 @@ from gpu_pnr.guide_router import (
     classify_nets,
     net_bbox,
 )
+from gpu_pnr.guides import guide_region
+from gpu_pnr.router import route_multipin_nets_3d
 
 # Shared synthetic geometry: origin at 0, 1000 DBU/cell, three layers.
 ORIGIN = (0, 0)
@@ -155,14 +158,149 @@ def test_guide_router_classify_matches_free_function():
     assert tail == []
 
 
-def test_guide_router_route_is_stub():
-    """Slice 1: GuideRouter.route is a placeholder; routing lands in Slice 2+."""
+def test_route_requires_a_grid():
+    """route needs a cost tensor; classification alone doesn't."""
     router = GuideRouter(
-        w_chip=None, w_v_chip=None, chip_origin=ORIGIN, layer_order=LAYERS,
+        w_chip=None, chip_origin=ORIGIN, layer_order=LAYERS,
         pitch_dbu=PITCH, chip_shape=CHIP_SHAPE,
     )
-    with pytest.raises(NotImplementedError):
-        router.route([[(0, 0, 0), (1, 1, 1)]], [[]])
+    with pytest.raises(ValueError, match="w_chip"):
+        router.route([[(0, 0, 0), (0, 1, 1)]], [[]])
+
+
+def _full_guide(h_cells: int, w_cells: int, layer: str = "M1"):
+    """A guide rect covering the whole `h_cells × w_cells` grid on `layer`."""
+    return [_rect(0, 0, w_cells * PITCH, h_cells * PITCH, layer)]
+
+
+def test_route_single_net_matches_direct():
+    """One in-cap net routed by GuideRouter equals route_multipin_nets_3d on the
+    same guide sub-grid, with paths translated back to chip-global coords."""
+    chip = torch.full((1, 10, 10), 1.0)
+    pins = [(0, 5, 5), (0, 7, 7)]
+    guide = [_rect(5000, 5000, 8000, 8000, "M1")]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    [res] = router.route([pins], [guide])
+    assert res.routed
+    assert res.pins == pins  # result carries the chip-global pins
+
+    # Reference: slice the original chip by the same region, route, translate.
+    reg = guide_region(
+        guide, ORIGIN, LAYERS, PITCH, margin=4, chip_shape=(1, 10, 10),
+    )
+    assert reg is not None
+    w_sub = chip[reg.l0:reg.l1, reg.r0:reg.r1, reg.c0:reg.c1].clone()
+    local = [reg.rebase(p) for p in pins]
+    [ref] = route_multipin_nets_3d(w_sub, [local])
+    ref_global = {
+        (lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in ref.cells
+    }
+    assert res.cells == ref_global
+
+
+def test_two_nets_detour_no_conflict():
+    """A second net detours around the first's committed cells via the shared
+    w_cur — both route, zero cross-net cell conflicts."""
+    chip = torch.full((1, 5, 5), 1.0)
+    guide = _full_guide(5, 5)
+    net_a = [(0, 2, 0), (0, 2, 2)]   # HPWL 2 → routes first, claims row-2 cols 0-2
+    net_b = [(0, 0, 1), (0, 4, 1)]   # HPWL 4 → must cross row 2; detours via open col
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    res_a, res_b = router.route([net_a, net_b], [guide, guide])
+    assert res_a.routed and res_b.routed
+    assert res_a.cells.isdisjoint(res_b.cells)  # 0 cross-net conflicts
+
+
+def test_hpwl_order_decides_contention():
+    """Routing order is HPWL-ascending, not input order: on a 1-row corridor the
+    shorter net routes first and claims the shared cells, starving the longer
+    one. Input order is [long, short] to prove HPWL order wins."""
+    chip = torch.full((1, 1, 5), 1.0)
+    guide = _full_guide(1, 5)
+    long_net = [(0, 0, 0), (0, 0, 4)]   # HPWL 4; only path crosses cols 1-3
+    short_net = [(0, 0, 1), (0, 0, 2)]  # HPWL 1; claims cols 1-2
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    res_long, res_short = router.route(
+        [long_net, short_net], [guide, guide],  # input order: long first
+    )
+    assert res_short.routed       # shorter HPWL → routed first
+    assert not res_long.routed    # corridor taken, no detour on one row
+    # Results are returned in input order regardless of routing order.
+    assert res_long.pins == long_net and res_short.pins == short_net
+
+
+def test_tail_net_returns_unrouted():
+    """No-guide (tail) nets are not routed in Slice 2 — placeholder result."""
+    chip = torch.full((1, 5, 5), 1.0)
+    net = [(0, 1, 1), (0, 3, 3)]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    [res] = router.route([net], [[]])  # empty guide → tail
+    assert not res.routed
+    assert res.pins == net
+
+
+def test_off_region_net_unrouted():
+    """An in-cap net whose guide region doesn't contain every pin can't be swept
+    on that sub-grid → unrouted (off-region handling, deferred from Slice 1)."""
+    chip = torch.full((1, 10, 10), 1.0)
+    tiny_guide = [_rect(0, 0, 1000, 1000, "M1")]  # region ~rows/cols [0,5)
+    net = [(0, 0, 0), (0, 8, 8)]  # second pin outside the region
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    [res] = router.route([net], [tiny_guide])
+    assert not res.routed
+
+
+def test_prep_subgrid_applied_without_corrupting_shared_grid():
+    """prep_subgrid runs once per in-cap net on a clone; its mutations must not
+    leak into the shared w_cur (the router clones before prepping)."""
+    chip = torch.full((1, 5, 5), 1.0)
+    guide = _full_guide(5, 5)
+    calls: list[list[tuple[int, int, int]]] = []
+
+    def prep(w_sub: torch.Tensor, local_pins: list[tuple[int, int, int]]) -> None:
+        calls.append(list(local_pins))
+        w_sub[0, 0, 0] = float("inf")  # mutate the clone — must not persist
+
+    net_a = [(0, 1, 0), (0, 1, 2)]
+    net_b = [(0, 3, 0), (0, 3, 2)]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH,
+        margin=4, prep_subgrid=prep,
+    )
+    res_a, res_b = router.route([net_a, net_b], [guide, guide])
+    assert len(calls) == 2  # once per in-cap net
+    assert res_a.routed and res_b.routed
+    assert torch.isfinite(chip[0, 0, 0])  # original tensor untouched by prep
+
+
+def test_route_preserves_input_order():
+    """Output list aligns with input order across a mix of in-cap and tail nets."""
+    chip = torch.full((1, 8, 8), 1.0)
+    guide = _full_guide(8, 8)
+    nets = [
+        [(0, 1, 1), (0, 2, 2)],   # 0: in-cap, routes
+        [(0, 5, 5), (0, 6, 6)],   # 1: no guide → tail
+        [(0, 0, 0), (0, 3, 3)],   # 2: in-cap, routes
+    ]
+    guides = [guide, [], guide]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    results = router.route(nets, guides)
+    assert len(results) == 3
+    assert [r.pins for r in results] == nets
+    assert results[0].routed and results[2].routed
+    assert not results[1].routed  # tail
 
 
 def test_netplan_carries_index_pins_region():

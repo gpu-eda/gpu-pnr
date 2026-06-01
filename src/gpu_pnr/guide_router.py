@@ -33,9 +33,10 @@ Conventions:
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+
+import torch
 
 from gpu_pnr.guides import (
     GuideRect,
@@ -43,11 +44,13 @@ from gpu_pnr.guides import (
     clamp_region_bounds,
     guide_region,
 )
+from gpu_pnr.router import MultiPin3DResult, route_multipin_nets_3d
 
-if TYPE_CHECKING:
-    import torch
-
-    from gpu_pnr.router import MultiPin3DResult
+# Per-net sub-grid preparation hook: `(w_sub, local_pins) -> None`, applied
+# in-place to a *clone* of each net's sub-grid before routing. Lets a caller
+# inject PDK structural rules (e.g. `apply_pin_access_rules`) without coupling
+# the router to any PDK. `local_pins` are in sub-grid-local coords.
+PrepSubgrid = Callable[["torch.Tensor", list[tuple[int, int, int]]], None]
 
 
 # A net's pin list: (layer, row, col) cells.
@@ -202,14 +205,15 @@ def classify_nets(
 class GuideRouter:
     """Chip-scale guide-constrained router (ADR 0012 as amended).
 
-    Slice 1: only the classification surface is implemented. `route` is a
-    stub; the pipeline (single-stream → batched sweep → conflict/ripup →
-    coarsened tail) lands in Slices 2–6 per
+    Slices 1–2: classification + single-stream routing. Batched routing,
+    conflict/ripup, and the coarsened tail land in Slices 3–6 per
     `docs/plans/ws33-tile-router-implementation.md`.
 
     `chip_shape` is taken from `w_chip` when a tensor is given, else from the
     explicit `chip_shape` argument (so the classifier is testable without a
-    cost tensor).
+    cost tensor). `prep_subgrid`, if given, is applied in-place to a clone of
+    each net's sub-grid before routing — the PDK-injection hook (see
+    `PrepSubgrid`).
     """
 
     def __init__(
@@ -223,6 +227,7 @@ class GuideRouter:
         margin: int = 4,
         chip_shape: tuple[int, int, int] | None = None,
         axis_cap: int = DEFAULT_AXIS_CAP,
+        prep_subgrid: PrepSubgrid | None = None,
     ) -> None:
         if pitch_dbu <= 0:
             raise ValueError(f"pitch_dbu must be positive; got {pitch_dbu}")
@@ -235,6 +240,7 @@ class GuideRouter:
         self.pitch_dbu = pitch_dbu
         self.margin = margin
         self.axis_cap = axis_cap
+        self.prep_subgrid = prep_subgrid
         if chip_shape is not None:
             self.chip_shape: tuple[int, int, int] | None = chip_shape
         elif w_chip is not None:
@@ -259,10 +265,91 @@ class GuideRouter:
         self,
         nets: list[Net3D],
         guides: Sequence[Sequence[GuideRect]],
+        *,
+        via_cost: float = 1.0,
     ) -> list[MultiPin3DResult]:
-        """Route nets; API mirrors `route_multipin_nets_3d` plus per-net guides.
+        """Route nets single-stream on the shared chip cost grid (Slice 2).
 
-        Slice 1 stub; routing lands in Slice 2+.
+        In-cap nets route sequentially in HPWL-ascending order, each on a
+        sub-grid sliced from the *current* shared `w_cur`: once a net commits,
+        its cells become `inf`, so later nets see them as obstacles and detour.
+        Cross-net conflict thus emerges from routing order — no explicit
+        conflict pass yet (rip-up lands in Slice 4). Tail nets (over-cap /
+        no-guide) and nets whose region doesn't contain all their pins are
+        returned unrouted; the coarsened-pass fallback for the tail lands in
+        Slice 5.
+
+        Results are returned in input order. Paths and pins are in chip-global
+        `(layer, row, col)` coordinates. API mirrors `route_multipin_nets_3d`
+        plus the per-net `guides` (parallel to `nets`).
         """
-        del nets, guides
-        raise NotImplementedError("Slice 1 stub; routing lands in Slice 2+")
+        if self.w_chip is None:
+            raise ValueError("route requires a w_chip cost tensor")
+
+        # tail nets (over-cap / no-guide) keep the unrouted sentinel below.
+        in_cap, _ = self.classify(nets, guides)
+        inf = float("inf")
+        w_cur = self.w_chip.clone()
+        w_v_cur = self.w_v_chip.clone() if self.w_v_chip is not None else None
+        # Tracks cells committed by earlier nets. Needed only with prep_subgrid:
+        # a PDK prep (e.g. pin-access) rewrites landing-pad cells to finite,
+        # which would *resurrect* a prior net's committed wire and let two nets
+        # share a cell. We re-block committed cells after prep to prevent that.
+        # NOTE for Slice 4 (rip-up): un-committing a net's cells must also clear
+        # its bits here, or a rerouted net could be wrongly re-blocked.
+        committed = (
+            torch.zeros_like(w_cur, dtype=torch.bool)
+            if self.prep_subgrid is not None else None
+        )
+
+        # Pre-fill every slot unrouted (preserving input order); tail, off-region,
+        # and route-fail nets keep this sentinel — only successful routes overwrite.
+        results = [MultiPin3DResult(list(pins), None) for pins in nets]
+
+        for plan in in_cap:  # HPWL-ascending
+            reg = plan.region
+            if not all(reg.contains(p) for p in plan.pins):
+                continue  # off-region: leave the unrouted sentinel
+            rl = (slice(reg.l0, reg.l1), slice(reg.r0, reg.r1), slice(reg.c0, reg.c1))
+            w_sub = w_cur[rl]
+            w_v_sub = w_v_cur[rl] if w_v_cur is not None else None
+            local = [reg.rebase(p) for p in plan.pins]
+            if self.prep_subgrid is not None:
+                # Clone first: prep mutates in place, and w_sub is a view into
+                # the shared w_cur — prepping the view would corrupt it. prep is
+                # called on both the H and V cost grids (see PrepSubgrid).
+                assert committed is not None
+                sub_committed = committed[rl]
+                w_sub = w_sub.clone()
+                self.prep_subgrid(w_sub, local)
+                w_sub[sub_committed] = inf  # prep must not resurrect prior wires
+                if w_v_sub is not None:
+                    w_v_sub = w_v_sub.clone()
+                    self.prep_subgrid(w_v_sub, local)
+                    w_v_sub[sub_committed] = inf
+            local_res = route_multipin_nets_3d(
+                w_sub, [local], via_cost=via_cost, w_v=w_v_sub,
+            )[0]
+            if local_res.paths is None:
+                continue  # route failed: leave the unrouted sentinel
+            # Translate sub-grid-local paths to chip-global and commit the routed
+            # cells as obstacles in the shared w_cur for later nets. One batched
+            # index-assignment, not per-cell (each scalar write is a kernel
+            # launch + sync on MPS — death by O(cells-per-net) launches).
+            global_paths = [
+                [(lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in path]
+                for path in local_res.paths
+            ]
+            cells = [c for path in global_paths for c in path]
+            ls, rs, cs = (
+                torch.tensor(axis, device=w_cur.device, dtype=torch.long)
+                for axis in zip(*cells)
+            )
+            w_cur[ls, rs, cs] = inf
+            if w_v_cur is not None:
+                w_v_cur[ls, rs, cs] = inf
+            if committed is not None:
+                committed[ls, rs, cs] = True
+            results[plan.index] = MultiPin3DResult(list(plan.pins), global_paths)
+
+        return results

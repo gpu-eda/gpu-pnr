@@ -1,6 +1,6 @@
 # Plan — WS3.3 guide-constrained router implementation
 
-**Status:** Active (2026-06-01; Slice 1 landed). Supersedes the 8-slice fixed-tile +
+**Status:** Active (2026-06-01; Slices 1–2 landed). Supersedes the 8-slice fixed-tile +
 K=100 + halo plan (in `git log` before this date), which
 [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–4 invalidated.
 
@@ -116,25 +116,31 @@ plus per-net guides; `route` is a `NotImplementedError` stub.
 
 ---
 
-### Slice 2 — Single-stream guide-constrained route (baseline)
+### Slice 2 — Single-stream guide-constrained route (baseline) ✅ DONE
 
-**Deliverable:** route each in-cap net on its own sub-grid sliced from the
-shared `w_cur`, **sequentially**, with backtrace + commit (routed cells →
-`inf` in `w_cur`, so later nets detour). This is the track-pitch prototype
-formalised into the router on a *shared* obstacle grid — cross-net conflict
-emerges from routing order. Multi-pin nets use the existing incremental
-tree-growth (`route_multipin_nets_3d` on the sub-grid).
+**Landed** in `GuideRouter.route` + `scripts/guide_router_hazard3.py` (7 new
+tests; suite 99 → 106). In-cap nets route sequentially in HPWL order, each on a
+sub-grid sliced from the *current* shared `w_cur`; routed cells commit to `inf`
+so later nets detour. Multi-pin nets reuse `route_multipin_nets_3d`. Tail and
+off-region nets keep an unrouted sentinel (coarsened pass = Slice 5).
 
-**Tests:**
-- single net: result matches `route_multipin_nets_3d` on the sub-grid.
-- two nets sharing a corridor: second detours around the first's committed
-  cells (cross-net via shared `w_cur`); 0 conflicts.
-- HPWL-ascending order honoured.
+- **PDK injection via `prep_subgrid`** — a per-sub-grid in-place hook (the
+  Hazard3 run passes `apply_pin_access_rules`); keeps the router PDK-agnostic.
+- **Conflict bug found + fixed:** the pin-access prep rewrites landing-pad cells
+  to finite, which *resurrected* prior nets' committed wires (4 cross-net
+  conflicts on the first cut). Fixed with a `committed` bool-mask re-block after
+  prep. **Slice 4 rip-up must clear those bits on un-commit** (noted in code).
+- **Hazard3 (100-net, track pitch): 0 cross-net conflicts on CPU + MPS**,
+  96% routed (4 honest contention failures, no rip-up yet), ms/net ≈ the
+  track-pitch prototype's mean (CPU 16.5, MPS 43). See `docs/results.md`
+  Phase 3.3 "GuideRouter Slice 2".
 
-**Exit:** tests pass; running on a Hazard3 sample reproduces the track-pitch
-prototype's ms/net and 0 cross-net conflicts (`docs/results.md` Phase 3.3).
+**Exit criterion met:** 0 cross-net conflicts + prototype-order ms/net.
 
-**Risk/walk-back:** none (this is the validated single-stream path).
+**Carried follow-up (cleanup):** the net-sampling loop (shuffle/filter/build) is
+duplicated across `track_pitch_sweep_prototype`, `batched_sweep_prototype`, and
+`guide_router_hazard3`; consolidate a `sample_nets` helper + the shared
+constants into `_hazard3_io.py` before another script needs them.
 
 ---
 
