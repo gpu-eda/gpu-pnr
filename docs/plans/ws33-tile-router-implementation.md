@@ -151,15 +151,22 @@ own sub-grid, commit. Nets in one batch route against the **same `w_cur`
 snapshot** (they don't see each other's commits); resulting conflicts are
 handled in Slice 4.
 
-**Multi-pin batching (the key design fork — open question):** the batched
-kernel is single-source, but multi-pin nets need multiple attachment sweeps
-(tree growth). Options:
-- **(c) start here:** batch the 2-pin nets (the bulk per Hazard3's M1/M2
-  distribution); route ≥3-pin nets sequentially via Slice 2's path. Matches
-  the data, lowest risk.
-- (a)/(b) refinement: batch round-*r* attachment sweeps across all nets still
-  growing. More throughput, more bookkeeping. Defer unless ≥3-pin nets
-  dominate the profile.
+**Multi-pin batching = round-batching (settled by
+[`../spikes/multi-pin-batching-strategy.md`](../spikes/multi-pin-batching-strategy.md)).**
+The data: 2-pin nets are 65.4% of nets but only **8.8% of sweep-work** on
+Hazard3; ≥3-pin nets carry **91.2% of work** (larger guide regions × more
+attachments per net). Batching 2-pin only would cap end-to-end speedup at
+~1.1×, throwing away Amendment 4's win on the bulk of work.
+
+So Slice 3 implements **option (b) round-batching**: each attachment round
+batches all nets still growing. Their sub-grids stay the same; the per-net
+source is the current tree-seed for that round. Round-1 batches ~19k nets,
+round-2 ~6.7k, round-3 ~2.6k — all well above the GPU's occupancy floor.
+
+Kernel addition (one-line of scope): extend `sweep_sssp_3d_batched` to take
+per-net `extra_sources` (the single-source kernel already supports it; the
+batched form needs a per-batch-slice list). The committed-tree-as-seeds set
+becomes the per-net `extra_sources` for the next round.
 
 **Tests:**
 - batched group route == per-net sequential (same `w_cur` snapshot) for
@@ -263,9 +270,11 @@ When Slice 6 ships:
 
 ## Open questions
 
-1. **Multi-pin batching strategy** (Slice 3): start with (c) 2-pin-batch +
-   sequential ≥3-pin, or invest in (a)/(b) per-round attachment batching
-   up front? Leaning (c); revisit on profile data.
+1. ~~**Multi-pin batching strategy**~~ — **Resolved (2026-06-01)**: option (b)
+   round-batching, per
+   [`../spikes/multi-pin-batching-strategy.md`](../spikes/multi-pin-batching-strategy.md).
+   Data: 2-pin nets carry only 8.8% of Hazard3 sweep-work; ≥3-pin nets carry
+   91.2%. Slice 3 implements round-batching with per-net `extra_sources`.
 2. **Module rename** (Slice 1): `tile_router.py` → `guide_router.py`?
    Leaning rename; touches ADR 0012 §7's "module structure" line.
 
