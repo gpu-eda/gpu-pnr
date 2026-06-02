@@ -206,7 +206,15 @@ twice. WS3.3 is the right next step.
 
 ### WS3.3 — Guide-constrained sweep (was: tile decomposition)
 
-**Status:** [ADR 0012](../adr/0012-tile-decomposition.md) Accepted
+**Status: PAUSED (2026-06-02, [ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md)).**
+Slices 1–3 landed; Slice 3's end-to-end measurement showed round-batched
+routing is **1–11× slower than drt on MPS** (GPU ~5% utilised, bubble-bound —
+ADR 0012 Am5), falsifying the [`gpu-vs-drt-throughput`](../spikes/gpu-vs-drt-throughput.md)
+projection that justified the workstream. Slices 4–6 are **not being built on
+MPS**; E5 throughput is reframed as a CUDA experiment (ADR 0013). The
+correctness-validated code stays. History below is retained for the record.
+
+[ADR 0012](../adr/0012-tile-decomposition.md) Accepted
 2026-05-14, then **pivoted by Amendments 1–4** (2026-05-28/29): the
 fixed-tile + K=100 + halo design is dead; the model is now
 guide-constrained per-net sub-grids on the track pitch, parallelised by
@@ -257,24 +265,30 @@ single-stream baseline → batched routing → conflict detect/ripup (unlocks
 [ADR 0008](../adr/0008-defer-route-nets-batched.md)) → coarsened tail →
 terminal Hazard3 + 4096² gate.
 
-**Exit criteria for WS3.3:**
+**Exit criteria for WS3.3 — NOT MET, not being pursued on MPS (ADR 0013):**
 
-- [ ] A 4096² grid is routed by guide-constrained sweep with no quality
-      regression vs the un-batched `route_multipin_nets_3d` baseline at the
-      same scale (4096² being the current correctness ceiling, see ADR 0005).
-- [ ] Whole-chip integration on Hazard3 produces results competitive with
-      TritonRoute (within 1.2× wire, within 1.2× vias).
+- [ ] ~~A 4096² grid routed by guide-constrained sweep, no quality regression~~
+      — correctness gate met at small scale (Slice 3), but the workstream is
+      paused before the full gate.
+- [ ] ~~Whole-chip Hazard3 competitive with TritonRoute (≤1.2× wire/vias)~~ —
+      *quality* is on track (wire ~1.00×, vias ~0.45× on routed nets), but
+      *throughput* is 1–11× slower on MPS. The throughput half is reframed as a
+      CUDA experiment.
 
 ## Phase 3 exit criteria
 
-When all of these are true, this plan closes and a Phase 4 plan opens:
+WS3.2 is shipped; WS3.3 is **paused on MPS** (ADR 0013), so this plan does not
+close on its original terms. The throughput goal moves to a CUDA-gated
+successor; the quality and correctness results stand. Status:
 
-- [ ] WS3.2 fully shipped (preferred direction, multi-pin, per-via-pair).
-- [ ] WS3.3 fully shipped (guide-constrained sweep + whole-chip integration).
-- [ ] Updated TritonRoute comparison numbers documented in
-      [`../results.md`](../results.md).
-- [ ] Phase 4 sketches (DRC kernel co-iteration, CUDA port) promoted to a
-      successor plan.
+- [x] WS3.2 fully shipped (preferred direction, multi-pin, per-via-pair).
+- [~] WS3.3 — Slices 1–3 landed (classification, single-stream, round-batched);
+      Slices 4–6 paused (ADR 0013). E5 throughput → CUDA.
+- [x] TritonRoute comparison numbers documented in
+      [`../results.md`](../results.md) (Phase 3.2 quality, Phase 3.3
+      throughput + the negative drt execution-time result).
+- [ ] Phase 4 sketches (DRC kernel co-iteration, CUDA port, E1 cuOpt) promoted
+      to a successor plan — informed by ADR 0013's follow-up experiments.
 
 ## References
 

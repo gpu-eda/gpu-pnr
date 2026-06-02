@@ -1,8 +1,15 @@
 # Plan — WS3.3 guide-constrained router implementation
 
-**Status:** Active (2026-06-01; Slices 1–2 landed). Supersedes the 8-slice fixed-tile +
-K=100 + halo plan (in `git log` before this date), which
-[ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–4 invalidated.
+**Status: CLOSED — paused (2026-06-02, [ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md)).**
+Slices 1–3 landed and are correctness-validated; Slice 3's measurement showed
+round-batching is 1–11× slower than drt on MPS (GPU bubble-bound, ADR 0012
+Am5), so Slices 4–6 are **not being built on MPS**. E5 throughput is reframed
+as a CUDA experiment (ADR 0013). This plan is retained as the record of what
+was built and why it stopped; resume only under a CUDA workstream.
+
+Supersedes the 8-slice fixed-tile + K=100 + halo plan (in `git log` before
+2026-06-01), which [ADR 0012](../adr/0012-tile-decomposition.md) Amendments
+1–4 invalidated.
 
 <!--
 Status lifecycle: Proposed → Active → Closed (YYYY-MM-DD).

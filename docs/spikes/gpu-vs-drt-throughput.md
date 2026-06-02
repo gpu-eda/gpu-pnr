@@ -1,6 +1,43 @@
 # Spike — GPU sweep vs TritonRoute DRT throughput comparison
 
-**Status:** Open (2026-05-28).
+**Status:** Resolved — **negative** (2026-06-02). The "path to
+competitiveness" projection below (~0.16 ms/net, ~112× faster than DRT) was
+**falsified** by the WS3.3 Slice 3 end-to-end measurement. See
+[ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md) for the decision
+and [ADR 0012](../adr/0012-tile-decomposition.md) Amendment 5 for the data.
+
+## Resolution (2026-06-02): the projection was wrong on three counts
+
+The guide-constrained sweep was built (ADR 0012 Am1–4) on this spike's
+projection. Slice 3 ran it end-to-end on Hazard3 and measured **32–390
+ms/net** (not 0.16) — **1–11× *slower* than drt, not 112× faster**. The
+§"path to competitiveness" reasoning failed at each step:
+
+1. **"A net with a 50×30 guide bbox sweeps 3,000 cells."** Real Hazard3 guide
+   regions at track pitch are median 4,332 / p90 18,237 / **max 251,720**
+   cells. The 3,000-cell figure was 1–80× too small, so the ~0.16 ms/net it
+   produced never had a basis.
+2. **"At our current MPS throughput → ~0.16 ms/net... GPU acceleration on
+   top."** The GPU acceleration does not survive the end-to-end router: a
+   Metal System Trace shows **GPU ~5% utilised, 71% pipeline bubbles**. The
+   per-net CPU backtrace + eager dispatch sync starve the GPU; the sweep
+   primitive's 2.46–4.05× (real in isolation) is invisible end-to-end.
+3. **"The real GPU win comes from batching many small sub-grids."** Batching
+   pads every net to the batch's largest sub-grid; one 251k-cell net inflates
+   the batch tensor to ~1 GB. Per-net cost *rises* with batch size (69 → 32 →
+   391 ms/net) — batching is the regression, not the win.
+
+The §Analysis "why this isn't fatal" arguments (#3 "the search-space gap is
+fixable", #4 "DRT's region model maps to GPU tiles") were the right
+*intuitions* but the wrong *magnitudes*: the gap is fixable in principle, but
+on MPS the fix is dominated by transfer + bubble cost, not sweep cost. The
+remaining live hope — point #2 (CUDA's ~10× bandwidth) and the deferred
+on-GPU-backtrace / size-bucketing / non-eager-dispatch fixes — is exactly why
+ADR 0013 reframes E5 throughput as a **CUDA** experiment, not an MPS one.
+
+---
+
+**Original spike (Status: Open, 2026-05-28) — retained below for the record:**
 
 ## Question
 
