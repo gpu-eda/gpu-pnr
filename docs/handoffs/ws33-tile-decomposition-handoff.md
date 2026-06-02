@@ -29,9 +29,12 @@ all live in [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–4.
   `w_cur`. Hazard3-validated: **0 cross-net conflicts (CPU+MPS)**, 96% routed.
   `docs/results.md` Phase 3.3 "GuideRouter Slice 2".
 - **Slice 3** — round-batched routing (`_NetWork` + per-net `extra_sources` on
-  `sweep_sssp_3d_batched`). **MPS 1.34× faster than Slice 2** (32.1 vs 43.0
-  ms/net); CPU regresses (padding waste, no parallelism). Rough vs OpenROAD drt:
-  wirelength 1.003× on the in-cap subset. `docs/results.md` Phase 3.3 "Slice 3".
+  `sweep_sssp_3d_batched`). Correctness gate passes. **But throughput
+  regresses at scale (ADR 0012 Am5):** sample-100's 1.34× MPS win is a
+  small-batch artifact; at sample 1000 it's ~9.8× slower than sequential, ~11×
+  slower than drt. Metal trace: **GPU ~5% utilised, 71% pipeline bubbles** —
+  padding-poison transfers + per-net CPU backtrace starve the GPU.
+  `docs/results.md` Phase 3.3 "Slice 3 … execution-time reckoning".
 
 ## Next up: Slice 4 — cross-net conflict detect + rip-up / reroute
 
@@ -50,22 +53,27 @@ lowest-HPWL net (ADR 0007), requeues losers, reroutes against the updated
   handled in the round loop (per-net clone → prep → `w_sub[sub_committed]=inf`
   before stacking). Slice 4's reroute batches go through the same path; keep it.
 
-## Carried follow-ups from Slice 3 (not blocking Slice 4)
+## Carried follow-ups from Slice 3 (throughput fixes — not blocking Slice 4)
 
-- **Device-aware dispatch** — round-batching wins on MPS, loses 11.4× on CPU
-  (padding-to-max waste, no parallelism). A production router should route
-  sequential on CPU, round-batched on MPS.
-- **Backtrace is the walk-back watch** — per-net CPU backtrace (per-pin `.item()`
-  argmin + per-net `.cpu()`) is the unamortised cost; vectorise + hoist, or push
-  onto the GPU. Profile in Slice 6 (noted inline in `guide_router.py`).
-- **Size-bucketing (deferred Am4 lever)** — the 1.34× MPS win is below the
-  kernel spike's 2.46–4.05× because one batch pads every net to the largest
-  sub-grid (max 131k cells). Option-B bucketing recovers it; post-router.
-- **Extract `attach_nearest_pin`** — the per-attachment kernel (sweep→pick→
+The Slice 3 profile (ADR 0012 Am5) says the MPS router is **bubble- and
+transfer-bound, GPU ~5% utilised** — not sweep-bound. Fixes in priority order:
+
+- **(1) Kill the pipeline bubbles (largest lever).** Per-net CPU backtrace
+  (per-pin `.item()` argmin + per-net `.cpu()`) serialises while the GPU idles.
+  Move backtrace onto the GPU (or at least vectorise the argmin + hoist the
+  `.cpu()`), and convergence-mask so converged nets stop re-sweeping.
+- **(2) Size-bucketing (scaling fix).** A round pads every net to the batch max
+  (sample-1000 max 251,720 cells → ~1 GB `d_batch`); bucket by size so small
+  nets aren't inflated. This is the Am4 option-B lever, now a prerequisite.
+- **(3) Device-aware dispatch** — batching strictly loses on CPU; route
+  sequential on CPU, batched on MPS.
+- **(4) Extract `attach_nearest_pin`** — the per-attachment kernel (sweep→pick→
   backtrace→grow) is duplicated between `route_multipin_nets_3d` and the round
   loop; share it once Slice 4 settles whether the attachment step changes.
-- **`drt_compare.py` adds a 4th net-sampling copy** — fold into the `sample_nets`
-  helper below when it lands.
+- **(5) `drt_compare.py` adds a 4th net-sampling copy** — fold into `sample_nets`.
+
+Absolute speed is deferred to the CUDA/scale endgame (ADR 0001); Slices 4–6
+proceed on correctness, not throughput.
 
 ## OpenROAD drt reference (the Slice 6 quality gate)
 

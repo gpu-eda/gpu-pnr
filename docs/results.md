@@ -1042,10 +1042,65 @@ sample, 278 routed+matched, MPS:
   this says only that the guide-constrained sweep produces drt-competitive
   *wirelength* on the nets it routes.
 
+## Scaling + profiling — the execution-time reckoning (corrects the headline above)
+
+The 1.34× MPS win above is a **small-batch artifact**. Sweeping the sample size
+reveals the round-batched per-net cost is non-monotonic and collapses at scale,
+while the sequential baseline stays flat:
+
+| sample | round-batched ms/net | sequential ms/net | max sub-grid (cells) |
+|---:|---:|---:|---:|
+| 20 | 69 | — | — |
+| 100 | 32 | 40 | 131,412 |
+| 1000 | **391** | **40** | 251,720 |
+
+At sample 1000 round-batching is **~9.8× slower than our own sequential
+baseline**; the whole-chip extrapolation is **~134 min vs OpenROAD drt's ~12
+min (~11× slower)**. Per-net throughput vs drt: 1.06× at sample 300 (near par),
+but that's the optimistic regime — drt does the complete, DRC-clean job at 29.7
+ms/net while ours omits rip-up/tail/DRC.
+
+**Why it collapses — Metal System Trace of the sample-1000 route**
+(`profiler_correlated_timeline`, 35 s window):
+
+| phase | % wall-clock |
+|---|---:|
+| PIPELINE_BUBBLE (neither side saturated) | **71.4%** |
+| CPU_BOUND | 22.9% |
+| BALANCED | 5.7% |
+| **GPU_BOUND** | **0.0%** |
+
+**Total GPU compute ≈ 1.6 s of 35 s → ~5% GPU utilisation.** The MPS device is
+barely used. Two compounding causes:
+
+1. **Padding poison (scaling driver).** A round pads every still-growing net to
+   the batch's largest sub-grid; one 251,720-cell net inflates `d_batch` to
+   ~1 GB and taxes every host↔device transfer. Bigger samples → more likely to
+   contain a giant net → worse per-net cost. This is exactly the option-B
+   size-bucketing lever ADR 0012 Am4 deferred — for the end-to-end router it's a
+   prerequisite, not optional.
+2. **Pipeline bubbles (the deeper problem).** Each round bursts a batched sweep,
+   then the CPU does ~K sequential per-net backtraces (`d_cpu[k]` slice +
+   `.item()` reads + `subgrids_h[k].cpu()`) while the GPU idles. Even the sweep
+   is many tiny eager Metal dispatches (4 axis sweeps + L via-relaxes ×
+   ~200 iters) with per-iteration sync. The GPU is starved regardless of padding.
+
+**Conclusion (ADR 0012 Amendment 5):** round-batching as built is not the MPS
+throughput path — it's slower than sequential CPU routing *and* OpenROAD drt at
+realistic scale. The fixes, priority order: (a) on-GPU backtrace +
+convergence-masking to kill the 71% bubbles (the GPU is idle 95% of the time);
+(b) size-bucketing to shrink the ~1 GB transfers. The absolute speed case is
+deferred to the CUDA/scale endgame (ADR 0001). Slices 4–6 proceed on
+correctness; this is a *throughput* walk-back, not an architecture one.
+
 ## Reproduce (Slice 3)
 
 ```sh
 uv run python scripts/guide_router_hazard3.py --device mps --sample 100   # round-batched
-uv run python scripts/track_pitch_sweep_prototype.py --device mps --sample 100  # sequential A/B
-uv run python scripts/drt_compare.py --device mps --sample 300            # vs drt (rough)
+uv run python scripts/guide_router_hazard3.py --device mps --sample 1000  # scaling collapse
+uv run python scripts/track_pitch_sweep_prototype.py --device mps --sample 1000  # flat sequential
+uv run python scripts/drt_compare.py --device mps --sample 300            # vs drt + exec-time
+# Profile (CPU vs GPU): Metal System Trace → profiler_correlated_timeline
+xctrace record --template "Metal System Trace" --output /tmp/route.trace --time-limit 35s \
+  --launch -- .venv/bin/python3 scripts/guide_router_hazard3.py --device mps --sample 1000
 ```

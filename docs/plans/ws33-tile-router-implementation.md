@@ -148,20 +148,24 @@ constants into `_hazard3_io.py` before another script needs them.
 
 **Landed** in `GuideRouter.route` (round-batched loop + `_NetWork`) +
 `sweep_sssp_3d_batched` per-net `extra_sources` + `scripts/drt_compare.py`
-(5 new tests; suite 106 → 111). Exit criterion met: **MPS 32.1 ms/net vs
-Slice 2's 43.0 — 1.34× faster** (`docs/results.md` Phase 3.3 "Slice 3"). Below
-the kernel spike's 2.46–4.05× because heterogeneous sub-grids force
-padding-to-max waste (size-bucketing, the deferred Am4 lever, recovers it).
-CPU regresses 11.4× (no parallelism to hide the padding) → **device-aware
-dispatch** follow-up. Rough net-matched vs OpenROAD drt: wirelength 1.003×
-aggregate (inside the ≤1.2× Slice 6 gate on the in-cap subset), vias 0.453×
-(partly model artifact) — orientation only, real gate is Slice 6.
+(5 new tests; suite 106 → 111). Correctness gate passes (disjoint == per-net
+sequential). **Throughput walk-back — ADR 0012 Amendment 5:** the sample-100
+1.34× MPS win is a small-batch artifact. At sample 1000 round-batched ms/net
+collapses to 391 (vs flat ~40 sequential) — **~9.8× slower than sequential,
+~11× slower than OpenROAD drt** whole-chip. A Metal System Trace shows **GPU
+~5% utilised, 71% pipeline bubbles**: padding-poison (~1 GB `d_batch`
+transfers) + per-net CPU backtrace starve the GPU. Size-bucketing +
+convergence-masking are now prerequisites, not deferred levers. Full data:
+`docs/results.md` Phase 3.3 "Slice 3 … execution-time reckoning". Rough vs drt
+quality (small sample): wirelength 1.003×, vias 0.453× — orientation only.
 
-**Carried follow-ups:** (1) device-aware dispatch (sequential on CPU); (2)
-vectorise the per-pin backtrace argmin + hoist per-net `.cpu()` (the walk-back
-watch — profile in Slice 6); (3) extract a shared `attach_nearest_pin` helper
-between `route_multipin_nets_3d` and the round loop; (4) `drt_compare.py` adds
-a 4th copy of the net-sampling loop the handoff already tracks.
+**Carried follow-ups (the throughput fixes, priority order):** (1) **kill the
+pipeline bubbles** — on-GPU backtrace + convergence-masking (the GPU is idle
+95%); (2) **size-bucketing** — stop padding small nets to the batch max; (3)
+device-aware dispatch (sequential on CPU, where batching strictly loses); (4)
+extract a shared `attach_nearest_pin` helper; (5) `drt_compare.py` adds a 4th
+copy of the net-sampling loop the handoff tracks. Absolute speed deferred to
+CUDA/scale (ADR 0001); Slices 4–6 proceed on correctness.
 
 **Deliverable:** replace the sequential per-net sweep with batched groups.
 Collect K independent in-cap nets, pad+stack their sub-grids (Amendment 4's

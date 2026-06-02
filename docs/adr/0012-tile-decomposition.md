@@ -647,6 +647,78 @@ track pitch on 128 Hazard3 nets (M4 Pro):
   Design TBD"; and the framing of the §3 batched sweep as an *unproven*
   hypothesis — it is now a validated decision.
 
+## Amendment 5 (2026-06-02): end-to-end round-batched routing regresses at scale — the sweep primitive's win does not survive the multi-pin router
+
+Amendment 4 validated the batched **sweep primitive** (2.46–4.05× on MPS) but
+explicitly bounded the claim (§Caveat): the per-net backtrace + tree growth at
+batch scale, and cross-net convergence, were **unmeasured** — "the decision is
+about the *sweep primitive*, not the end-to-end router throughput." Slice 3
+([`../plans/ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md))
+built the end-to-end round-batched router and measured it. The caveat was
+load-bearing: the primitive's win does not carry to the router.
+
+### Finding (`docs/results.md` Phase 3.3 "Slice 3 execution-time + profiling")
+
+Round-batched `GuideRouter.route` on Hazard3 (track pitch, M4 Pro MPS):
+
+- **Per-net cost is non-monotonic and explodes with batch size:** 69 → 32 →
+  **390 ms/net** at samples 20 / 100 / 1000. The sequential baseline stays flat
+  (~40 ms/net), so at sample 1000 **round-batching is ~9.8× slower than
+  sequential** and the whole-chip extrapolation is ~134 min vs OpenROAD drt's
+  ~12 min (~11× slower). The 1.34× sample-100 win was a small-batch artifact.
+- **The GPU is ~5% utilised.** A Metal System Trace of the sample-1000 route
+  (`profiler_correlated_timeline`) classifies **71% PIPELINE_BUBBLE, 0%
+  GPU_BOUND, 23% CPU_BOUND**; total GPU compute ≈ 1.6 s of 35 s. The round
+  structure ping-pongs: a short batched-sweep burst, then ~K sequential
+  CPU-side backtraces (each a `d_cpu[k]` slice + `.item()` reads +
+  `subgrids_h[k].cpu()` transfer) while the GPU idles.
+- **Two compounding causes.** (1) *Padding poison* — a round pads every net to
+  the batch's largest sub-grid (sample-1000 max 251,720 cells), so one giant
+  net inflates `d_batch` to ~1 GB and taxes every host↔device transfer; this is
+  the scaling driver. (2) *Pipeline bubbles* — the per-net CPU backtrace and the
+  eager per-iteration dispatch sync starve the GPU; this caps even the
+  small-batch case at ~par with CPU drt.
+
+### Decision
+
+1. **Round-batching as built is not the MPS throughput path.** Amendment 4 §3
+   deferred size-bucketing and §4 deferred convergence-masking as *optional*
+   levers. Slice 3 shows that for the **end-to-end router** they are
+   **prerequisites, not options**: without size-bucketing the padding transfers
+   dominate, and without on-GPU backtrace / convergence-masking the pipeline
+   bubbles keep the GPU at ~5%.
+2. **Do not re-architect Slices 4–6 around this.** The walk-back is contained to
+   the *throughput* of the in-cap batched pass. The guide-constrained model
+   (Am1), track pitch (Am3), and the sweep primitive (Am4) all stand. Slice 4
+   (rip-up) and Slice 5 (tail) proceed on correctness; the absolute speed case
+   is explicitly deferred to the CUDA/scale endgame ([ADR 0001](0001-pytorch-mps-host.md)),
+   where the ~10× bandwidth and a non-eager dispatch model change the picture.
+3. **The two named fixes, in priority order, when speed is in scope:**
+   **(a) kill the pipeline bubbles** — move backtrace onto the GPU (or vectorise
+   the per-net argmin + hoist the `.cpu()`), and convergence-mask so converged
+   nets stop re-sweeping; **(b) size-bucket** the batch so small nets aren't
+   padded to the max. (a) is the larger lever — the GPU is idle 95% of the time.
+
+### Consequences
+
+- The Slice 3 exit criterion ("batched ms/net beats single-stream") is met only
+  at small sample; the honest whole-chip result is a regression. Recorded as
+  such in `docs/results.md`; the plan's Slice 3 follow-ups carry the fixes.
+- Amendment 4's "GPU beats CPU for the sweep step" still holds for the
+  *primitive* in isolation; Amendment 5 narrows it: **the primitive's win is
+  invisible end-to-end on MPS** because the router is bubble- and
+  transfer-bound, not sweep-bound.
+
+### What survives / is superseded
+
+- **Survives:** the guide-constrained pivot (Am1), track pitch (Am3), the
+  batched sweep *primitive* and its 2.46–4.05× (Am4, in isolation); the
+  six-slice plan's correctness path (Slices 4–6).
+- **Superseded:** Amendment 4 §3/§4's framing of size-bucketing and
+  convergence-masking as *deferred optional* levers — for the end-to-end MPS
+  router they are prerequisites for any throughput win. Amendment 4's implicit
+  expectation that the primitive's win carries to the router is corrected.
+
 ## Links
 
 - [`../plans/phase3-detailed-routing.md`](../plans/phase3-detailed-routing.md)

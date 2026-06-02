@@ -14,6 +14,7 @@ gap — read it as an upper-bound on our excess, not a verdict.
 from __future__ import annotations
 
 import argparse
+import json
 import random
 import sys
 import time
@@ -45,6 +46,24 @@ PDK = GF180MCUD
 VIA_COST = 5.0
 DBU_PER_UM = 2000  # DEF: UNITS DISTANCE MICRONS 2000
 PITCH = TRACK_PITCH_DBU  # 1120 DBU per track-grid step
+
+
+def drt_reference() -> dict[str, float]:
+    """OpenROAD drt totals for the fixture's run, from the detailed-routing
+    step beside FINAL_DEF (`44-openroad-detailedrouting/`): net count,
+    wirelength (µm), via count, and wall-clock seconds. This is the Slice 6
+    gate's reference — parsed, not re-run."""
+    run_dir = FINAL_DEF.parents[2]  # .../RUN_*/final/def/x.def → .../RUN_*
+    drt_dir = run_dir / "44-openroad-detailedrouting"
+    metrics = json.loads((drt_dir / "or_metrics_out.json").read_text())
+    hms = (drt_dir / "runtime.txt").read_text().strip()  # "HH:MM:SS.mmm"
+    h, m, s = hms.split(":")
+    return {
+        "nets": metrics["route__net"],
+        "wire_um": metrics["route__wirelength"],
+        "vias": metrics["route__vias"],
+        "runtime_s": int(h) * 3600 + int(m) * 60 + float(s),
+    }
 
 
 def our_wire_vias(paths: list[list[tuple[int, int, int]]]) -> tuple[int, int]:
@@ -162,6 +181,26 @@ def main(argv: list[str] | None = None) -> None:
     print(f"    per-net ratio: median={_pct(via_sorted,0.5):.3f}× "
           f"mean={sum(via_ratios)/max(len(via_ratios),1):.3f}×")
     print(f"    totals: ours={our_via_tot} drt={drt_via_tot}")
+
+    # Execution time — our per-net (over the sampled in-cap nets) vs drt's
+    # per-net (over the whole chip, complete + DRC-clean). drt's runtime is
+    # on the fixture's build machine, ours on this one — wall-clock is NOT
+    # hardware-matched, so read per-net throughput as the headline, not the
+    # whole-chip totals.
+    ref = drt_reference()
+    our_ms_net = elapsed * 1000.0 / max(len(nets), 1)
+    drt_ms_net = ref["runtime_s"] * 1000.0 / max(ref["nets"], 1)
+    our_chip_s = our_ms_net * ref["nets"] / 1000.0  # extrapolated to drt's net set
+    print("\n  EXECUTION TIME (per-net throughput is the fair axis):")
+    print(f"    ours:  {our_ms_net:.1f} ms/net  ({len(nets)} in-cap nets, "
+          f"{device}, no rip-up/tail/DRC)")
+    print(f"    drt:   {drt_ms_net:.1f} ms/net  ({ref['nets']:.0f} nets, "
+          f"complete + DRC-clean, {ref['runtime_s']/60:.1f} min total)")
+    print(f"    per-net ratio (ours/drt): {our_ms_net/max(drt_ms_net,1e-9):.2f}× "
+          f"(>1 = we are slower per net)")
+    print(f"    whole-chip extrapolation: ours ~{our_chip_s/60:.1f} min vs "
+          f"drt {ref['runtime_s']/60:.1f} min — but ours omits rip-up/tail/DRC "
+          f"and is not hardware-matched.")
     print("\n  Gate (Slice 6, full-chip): ≤1.2× wire, ≤1.2× vias. "
           "This is in-cap-only, coarse-grid, no rip-up — orientation only.")
 
