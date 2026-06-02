@@ -1,178 +1,95 @@
-# Handoff — WS3.3 guide-constrained sweep: batched small-grid kernel resolved
+# Handoff — WS3.3 GuideRouter: Slices 1–2 landed, Slice 3 (batched) next
 
-**Created:** 2026-05-28; updated 2026-05-29 after the batched small-grid
-sweep prototype (follow-up 3 resolved). Supersedes the track-pitch-prototype
-handoff.
-**Working tree:** clean (after this session's commit)
+**Created:** 2026-05-28; refreshed 2026-06-02 (GuideRouter Slices 1–2 landed).
+**Working tree:** clean; all work pushed to `main` (CI green).
 **Branch:** main
 
 <!--
-Reminder: a handoff is ephemeral. At resolution, every load-bearing piece
-below migrates into a docs/adr/, docs/plans/, docs/spikes/, or design-doc
-home, and this file is then `git rm`'d in the same commit as the migration.
-
-See docs/handoff-discipline.md for the migration table.
+A handoff is ephemeral: it captures only what's in flight + the next pickup.
+The durable record already lives in its permanent homes — don't duplicate it
+here. At resolution, `git rm` this file (see Migration note).
 -->
 
-## Goal & next-up
+## Where things are
 
-**Goal of this session:** Follow-up 3 — prototype the **batched small-grid
-sweep kernel** and measure whether packing K *independent* sub-grids into
-one kernel call amortises the per-net launch+sync overhead the track-pitch
-prototype found binding (the load-bearing open hypothesis of the slot-scale
-spike).
+WS3.3 is mid-build: the guide-constrained router is being implemented in
+6 slices per
+[`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md)
+(the plan is the source of truth for slice status + design). Design decisions
+all live in [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–4.
 
-**Outcome (new spike
-[`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
-slot-scale spike's load-bearing hypothesis resolved YES; decision recorded
-in ADR 0012 Amendment 4):**
-- New `sweep_sssp_3d_batched` (`src/gpu_pnr/sweep.py`): K *independent*
-  per-net grids `(K,L,H,W)` in one fused call — the opposite of the dead
-  Tier-B `_multi` (K sources on one *shared* grid). 4 new correctness tests.
-- New `scripts/batched_sweep_prototype.py` times the per-net single-source
-  sweep batched (padded stack) vs sequential, at track pitch.
-- **Batching wins on GPU: MPS 2.46× (shuffled) to 4.05× (size-sorted)
-  faster than sequential.** CPU is *slower* batched (0.15–0.41×) — no
-  launch overhead to amortise, padding only adds work. The win is purely
-  GPU-overhead amortisation, confirming the track-pitch diagnosis.
-- **Padding waste is the option-A/B lever:** sorting cut waste 8.3×→3.2×
-  and lifted the win 2.46×→4.05×. Option A (padded stack) already wins;
-  option B (bucketing) is a ~1.6× deferred gain, not a prerequisite —
-  matches ADR 0012 Amendment 3's framing.
+**Done (folded into their homes — listed for orientation, not as a log):**
 
-**Next session should pick up:** **GuideRouter Slice 3** (batched routing via
-`sweep_sssp_3d_batched`, round-batching multi-pin nets per the resolved
-strategy) per
-[`ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md).
-Slices 1–2 landed: `gpu_pnr.guide_router` has `classify_nets` (in-cap/tail)
-and single-stream `route` on the shared `w_cur` — Hazard3-validated at 0
-cross-net conflicts (CPU+MPS), 96% routed (rip-up = Slice 4 recovers the rest).
-Slice 3 watch-outs from Slice 2: (a) the `prep_subgrid` hook is per-sub-grid —
-batched path applies it per-net before padding/stacking; (b) the `committed`
-bool-mask re-block after prep must carry into the batched path (and Slice 4
-rip-up must clear those bits). Carried cleanup: consolidate the duplicated
-net-sampling loop + Hazard3 constants into `_hazard3_io.py`. Loose ends
-(optional/blocked): follow-up 5 (CI bench baseline) and the pin-access ADR
-amendment (blocked on DEF pin extraction, ADR 0012 Am.3 open Q#1). Deferred
-levers (convergence-masking, option-B bucketing) in the batched-sweep spike.
+- **Substrate**: track-pitch grid, `guide_region` mapper, `sweep_sssp_3d_batched`
+  (batched kernel, 2.46–4.05× over sequential on MPS — ADR 0012 Am4 +
+  `docs/spikes/batched-small-grid-sweep.md`).
+- **Slice 1** — `gpu_pnr.guide_router`: `classify_nets` (in-cap vs over-cap/
+  no-guide tail), `NetPlan`, HPWL ordering. Replaced the deleted `tile_router.py`.
+- **Slice 2** — `GuideRouter.route`: single-stream routing on the shared
+  `w_cur`. Hazard3-validated: **0 cross-net conflicts (CPU+MPS)**, 96% routed.
+  `docs/results.md` Phase 3.3 "GuideRouter Slice 2".
 
-**Verification command:**
+## Next up: Slice 3 — batched routing via `sweep_sssp_3d_batched`
+
+Replace Slice 2's sequential per-net sweep with batched groups (the plan's
+Slice 3 section has the full sketch). Multi-pin batching strategy is **settled
+= round-batching** (`docs/spikes/multi-pin-batching-strategy.md`: 2-pin nets are
+only 8.8% of sweep-work, so batching them alone caps the win at ~1.1×). Needs a
+per-net `extra_sources` extension on `sweep_sssp_3d_batched`.
+
+**Watch-outs carried from Slice 2 (these will bite Slice 3/4 if ignored):**
+
+- **`prep_subgrid` is per-sub-grid.** The batched path must apply it per-net
+  *before* padding/stacking into the `(K,L,H,W)` tensor — it can't run on the
+  stacked tensor.
+- **The `committed` bool-mask re-block must carry into the batched path.** The
+  pin-access prep rewrites landing-pad cells to finite, which resurrects prior
+  nets' committed wires (this caused 4 cross-net conflicts in Slice 2 before the
+  fix). Any batched commit must re-block committed cells after prep too.
+- **Slice 4 rip-up must clear `committed` bits on un-commit** — noted in
+  `guide_router.py`. A rerouted net wrongly re-blocked otherwise.
+
+## Verification command
 
 ```sh
 cd ~/Code/gpu-pnr && uv run pytest tests/
-# Expect: 95 passed
+# Expect: 106 passed
 
-# Batched kernel correctness + the batched-vs-sequential measurement
-uv run pytest tests/test_sweep_3d.py -k batched               # Expect: 4 passed
-uv run python scripts/batched_sweep_prototype.py --device mps --sample 128 --batch 16
-# Expect: batched ~2.5× faster than sequential (MPS); correctness Δdist 0
-
-grep -c "Resolved YES" docs/spikes/batched-small-grid-sweep.md  # Expect: >=1
+uv run pytest tests/test_guide_router.py -q          # Expect: 18 passed
+# Slice 2 shared-grid validation: 0 cross-net conflicts, ~96% routed
+uv run python scripts/guide_router_hazard3.py --device cpu --sample 100
 ```
 
-## Done this session
+## Loose ends (not blocking Slice 3)
 
-| Artifact | What | Notes |
-|---|---|---|
-| `src/gpu_pnr/sweep.py` | `sweep_sssp_3d_batched` | K independent per-net grids `(K,L,H,W)`, one source/net, batch-wide seg_barrier |
-| `tests/test_sweep_3d.py` | 4 batched correctness tests | same-size, variable-size padded, anisotropic, bad-shape; suite 91 → 95 |
-| `scripts/batched_sweep_prototype.py` | batched vs sequential sweep harness | `--device/--sample/--batch/--sort-by-size`; isolates kernel overhead (H2D + pad excluded) |
-| `docs/spikes/batched-small-grid-sweep.md` | new spike, Resolved YES | MPS 2.46–4.05× faster batched; GPU-specific; padding-waste = option-B lever |
-| `docs/spikes/slot-scale-parallelism.md` | status → hypothesis resolved | load-bearing batching claim confirmed; links new spike |
+- **Carried cleanup:** the net-sampling loop (shuffle/filter/build pins) is
+  duplicated across `track_pitch_sweep_prototype`, `batched_sweep_prototype`,
+  and `guide_router_hazard3`. Consolidate a `sample_nets` helper + the shared
+  constants (`MIN_PINS`, `MAX_PINS`, `_net_pins`, `_pct`, `HAZARD3_ROUTABLE_NETS`)
+  into `_hazard3_io.py` before another script needs them.
+- **Deferred throughput levers** (post-router): convergence-masking and option-B
+  size-bucketing — see `docs/spikes/batched-small-grid-sweep.md` "next levers".
+- **CI bench baseline** (follow-up 5, optional): Tier B already concluded the
+  Tier-A 4× erosion is environmental; confirming on M2 at `e5dd5be` is optional.
+- **Pin-access ADR amendment** (blocked): the snap-vs-local-fine-region decision
+  needs DEF pin geometry (the guide fixture is GCell-granular). ADR 0012 Am3
+  open Q#1. Not on the WS3.3 critical path.
 
-## Open follow-ups (priority-ordered)
+## Critical context for Slice 3
 
-### 1. ✅ DONE — GRT guide-region mapper
-
-`gpu_pnr.guides.guide_region`. Maps a net's guide rects → grid sub-grid
-bbox. Validated on Hazard3 at both pitches.
-
-### 2. ✅ DONE — Track-pitch sweep prototype
-
-`scripts/track_pitch_sweep_prototype.py`. Measured ms/net ≫ the 0.24
-linear figure (MPS 16.8, CPU 2.57 median); CPU beats MPS at this grain;
-pin access cleared (intra-net merge 0 at both pitches). Folded into
-`docs/results.md` Phase 3.3 "track-pitch sweep prototype". **Net result:
-single-stream is overhead-bound → follow-up 3 is the real win.**
-
-### 3. ✅ DONE — Batched small-grid sweep kernel
-
-`sweep_sssp_3d_batched` + `scripts/batched_sweep_prototype.py`. Resolved
-YES: K independent sub-grids in one kernel call is **2.46–4.05× faster than
-sequential on MPS** (GPU-specific; CPU loses). Padding waste is the
-option-B lever (sorting nearly doubles the win). Folded into new spike
-[`batched-small-grid-sweep.md`](../spikes/batched-small-grid-sweep.md);
-slot-scale spike's load-bearing hypothesis resolved; **decision recorded in
-ADR 0012 Amendment 4** (batched sweep = the GPU-parallelism model). **Open
-levers: convergence-masking + option-B size bucketing toward the bandwidth
-floor.**
-
-### 4. ✅ DONE — Rewrite WS3.3 plan
-
-`docs/plans/ws33-tile-router-implementation.md` rewritten around the
-guide-constrained architecture: 6 slices (GuideRouter skeleton → single-stream
-baseline → batched routing → conflict/ripup → coarsened tail → Hazard3 +
-4096² gate). Parent `phase3-detailed-routing.md` §WS3.3 summary + exit
-criteria updated to match (dropped tile/halo wording). The plan carries 2
-**open questions** to confirm before the relevant slice: multi-pin batching
-strategy (Slice 3) and `tile_router.py`→`guide_router.py` rename (Slice 1).
-
-### 5. Resolve CI bench baseline question (small, low priority)
-
-Unchanged from prior handoff — Tier B already concluded environmental
-regression; confirming Tier A's 4× on M2 at `e5dd5be` is optional.
-
-## Critical context
-
-**ADR 0012 Amendments 2, 3 & 4 are the load-bearing docs.** Amendment 3 is
-the one that changes the plan: the over-sampled grid, not the algorithm,
-was the problem. Read it before touching the sweep.
-
-**The `guide_region` mapper is pitch-agnostic**, and as of this session so
-are `build_chip_grid` + `rect_center_to_grid` (`pitch_dbu` param, default
-200). All three work at 1120.
-
-**Pin access at track pitch is now measured, not feared.** Intra-net pin
-merge is 0 at both 200 and 1120 DBU, so coarsening to track pitch does not
-collapse any net's own pins — the pitch change is cleared. The tile
-prototype's 21/27 failures were *cross-net* collisions on a *shared* grid,
-which the per-net guide-constrained model structurally avoids (each net
-routes alone). The genuine off-track-pin question needs **DEF pin
-geometry** (the guide fixture is GCell-granular, not pin shapes); the
-formal snap-vs-fine-region ADR amendment is gated on that, not on pitch.
-See `docs/results.md` Phase 3.3 "Pin access at track pitch".
-
-**`tile_router.py` (Slice 1) still has reusable geometry** —
-`partition_chip`, `net_bbox`, `classify_nets`. Don't delete; the
-guide-constrained router may repurpose the partition logic.
-
-## References
-
-- [ADR 0012](../adr/0012-tile-decomposition.md) Amendments 1–3 — the
-  guide-constrained sweep design and the track-pitch pivot.
-- [slot-scale-parallelism spike](../spikes/slot-scale-parallelism.md) —
-  wafer.space 1×1 slot scaling; batched kernel is the next bet.
-- [GPU vs DRT spike](../spikes/gpu-vs-drt-throughput.md) — search-space
-  framing and DRT baseline.
-- [`../results.md`](../results.md) Phase 3.3 — guide-region size
-  distributions (200 vs 1120 DBU).
-- [`../plans/ws33-tile-router-implementation.md`](../plans/ws33-tile-router-implementation.md)
-  — obsolete 8-slice plan (follow-up 4 rewrites it).
+- **The router is PDK-agnostic by design.** It routes on whatever `w_chip` it's
+  given; PDK rules (pin-access) are injected via the `prep_subgrid` hook, wired
+  up only in `scripts/guide_router_hazard3.py`. Keep it that way.
+- **CPU beats MPS at this grain** (single net ~4k cells, overhead-bound) — the
+  track-pitch prototype and Slice 2 both confirm it. Slice 3's batched kernel is
+  precisely the fix; the win to reproduce end-to-end is the spike's 2.46–4.05×.
+- **`net_bbox` survives** in `guide_router.py` as the no-guide fallback region
+  builder + HPWL source. The rest of the old tile machinery is gone.
 
 ## Migration note
 
-When the remaining follow-ups land and this handoff resolves:
-
-- Follow-up 2 (track-pitch prototype) → ✅ results already in
-  `docs/results.md` Phase 3.3. Still open: the pin-access ADR amendment
-  (close open question #1/#2), gated on DEF pin extraction.
-- Follow-up 3 (batched kernel) → ✅ resolved. Finding in
-  `docs/spikes/batched-small-grid-sweep.md` + slot-scale spike status
-  update; the *decision* it settles is recorded in **ADR 0012 Amendment 4**
-  (batched small-grid sweep adopted as the GPU-parallelism model; option A
-  confirmed, B a deferred lever) — no new ADR needed, it amends 0012.
-- Follow-up 4 (plan rewrite) → updated
-  `docs/plans/ws33-tile-router-implementation.md`.
-- Then `git rm docs/handoffs/ws33-tile-decomposition-handoff.md` in the
-  migration commit: `docs: resolve WS3.3 handoff — fold into plan +
-  track-pitch prototype`.
+This handoff resolves when WS3.3 ships (Slice 6). Everything load-bearing is
+already in its permanent home — plan (slice status), ADR 0012 (Am 1–4),
+`docs/results.md` Phase 3.3, and the spikes. At that point `git rm` this file in
+the same commit that flips the WS3.3 boxes in `phase3-detailed-routing.md`:
+`docs: resolve WS3.3 handoff — guide-constrained router shipped`.
