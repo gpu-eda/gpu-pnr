@@ -961,3 +961,91 @@ the router's `prep_subgrid` hook).
 uv run python scripts/guide_router_hazard3.py --device cpu --sample 100
 uv run python scripts/guide_router_hazard3.py --device mps --sample 100
 ```
+
+# Phase 3.3 — GuideRouter Slice 3: round-batched routing
+
+Slice 3 replaces Slice 2's sequential per-net sweep with **round-batching**
+(`docs/spikes/multi-pin-batching-strategy.md` option b): each attachment round
+packs every still-growing net's sub-grid into one `(K,L,H,W)` tensor (pad =
+`inf`), runs a single `sweep_sssp_3d_batched` with each net's current tree as
+per-net `extra_sources`, backtraces each slice, and commits fully-routed nets
+between rounds. Nets in a round share the **same `w_cur` snapshot** (no
+intra-round commit visibility), so same-round overlaps are deferred conflicts —
+Slice 4's job, not handled here.
+
+Same script/sample/seed as Slice 2 (100 nets, seed 0, track pitch, M4 Pro),
+A/B against the Slice 2 single-stream numbers recorded above:
+
+| Device | Slice 2 (single-stream) | Slice 3 (round-batched) | result |
+|---|---:|---:|---|
+| MPS | 43.0 ms/net | **32.1 ms/net** | **1.34× faster** |
+| CPU | 16.5 ms/net | 188.0 ms/net | 11.4× slower |
+
+- **MPS 1.34× faster** — the exit criterion ("batched ms/net beats single-stream")
+  is met on the target device. It is *below* the batched-kernel spike's
+  2.46–4.05× ceiling (`docs/spikes/batched-small-grid-sweep.md`) because a round
+  pads every net up to the batch's largest sub-grid (sample: median 4332, p90
+  18237, **max 131412** cells), and that padding waste is unrecovered without
+  **option-B size-bucketing** (the deferred ADR 0012 Am4 lever). The win also
+  grows with batch size: sample 20 → 69 ms/net, sample 100 → 32 ms/net.
+- **CPU 11.4× slower** — expected, and the inverse of the MPS story: CPU gets no
+  parallelism payoff for the padded `K×max-grid` work, so padding waste is pure
+  cost. A production router wants **device-aware dispatch** (sequential on CPU,
+  round-batched on MPS). Carried as a Slice 3 follow-up.
+- **Conflicts now non-zero (19/99 sample)** — *by design*, not a regression. The
+  shared-snapshot semantics defer cross-net conflicts to Slice 4; Slice 2's
+  0-conflict invariant came from sequential commits. The script's conflict line
+  is informational for Slice 3, not a pass/fail gate.
+
+**Walk-back watch (ADR 0012 Slice 3 risk):** the per-net backtrace is CPU-side
+and sequential per net per round (`guide_router.py`). At ~19k nets/round the
+batched sweep is one GPU launch but backtrace is ~19k Python loops; if it
+dominates the kernel saving at full scale, that is the signal to push backtrace
+onto the GPU. Not isolated yet (the 1.34× is net of both effects); profile in
+Slice 6.
+
+## vs OpenROAD drt (TritonRoute) — rough, orientation only
+
+The WS3.3 Slice 6 quality gate is ≤1.2× wire, ≤1.2× vias vs OpenROAD's detailed
+router. The reference is pre-computed in the LibreLane fixture (run
+`RUN_2026-05-08_22-32-24/44-openroad-detailedrouting`, the same run our GUIDE +
+FINAL_DEF read), so the gate is a metrics-parse, not an OpenROAD run:
+
+| OpenROAD drt (Hazard3, full chip) | value |
+|---|---:|
+| nets | 24,124 |
+| wirelength | 1,234,353 µm |
+| vias | 181,514 (all single-cut) |
+| DRC errors | 0 |
+| wall-clock | ~11m57s |
+
+`scripts/drt_compare.py` does an early **net-matched** probe (compare only nets
+we *both* route, so the in-cap-coverage gap doesn't bias the ratio). 300-net
+sample, 278 routed+matched, MPS:
+
+| metric | aggregate (Σours/Σdrt) | per-net median | per-net p90 |
+|---|---:|---:|---:|
+| wirelength | **1.003×** | 1.05× | 1.88× |
+| vias | **0.453×** | 0.50× | — |
+
+- **Wirelength on par with drt** (1.003× aggregate; 9535 vs 9507 µm) — inside the
+  ≤1.2× gate *on this subset*. The p90 1.88× is a tail of nets paying a
+  coarse-grid (1120-DBU) detour penalty drt avoids with fine jogs.
+- **~2× fewer vias** (0.453×) — partly real (`via_cost=5.0` minimises layer
+  changes; small nets route on 1–2 layers) and partly a coarse-grid/model
+  artifact: drt adds pin-access + congestion + DRC-driven vias our track grid
+  doesn't represent (drt ~6 vias/matched-net vs our ~2.8). Do **not** bank this
+  as a pure win.
+- **Heavily caveated:** in-cap subset only (excludes the over-cap clock/power
+  nets that carry most of drt's totals), coarse grid vs fine geometry (ratio is
+  an upper bound on our excess), no rip-up. The real verdict needs Slices 4+5 —
+  this says only that the guide-constrained sweep produces drt-competitive
+  *wirelength* on the nets it routes.
+
+## Reproduce (Slice 3)
+
+```sh
+uv run python scripts/guide_router_hazard3.py --device mps --sample 100   # round-batched
+uv run python scripts/track_pitch_sweep_prototype.py --device mps --sample 100  # sequential A/B
+uv run python scripts/drt_compare.py --device mps --sample 300            # vs drt (rough)
+```

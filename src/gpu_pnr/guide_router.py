@@ -44,7 +44,8 @@ from gpu_pnr.guides import (
     clamp_region_bounds,
     guide_region,
 )
-from gpu_pnr.router import MultiPin3DResult, route_multipin_nets_3d
+from gpu_pnr.router import MultiPin3DResult
+from gpu_pnr.sweep import backtrace_3d, sweep_sssp_3d_batched
 
 # Per-net sub-grid preparation hook: `(w_sub, local_pins) -> None`, applied
 # in-place to a *clone* of each net's sub-grid before routing. Lets a caller
@@ -202,6 +203,26 @@ def classify_nets(
     return in_cap, tail
 
 
+@dataclass
+class _NetWork:
+    """Mutable per-net routing state advanced one attachment per round.
+
+    Internal to `GuideRouter.route`'s round-batched loop (Slice 3). Mirrors the
+    sequential tree-growth locals in `route_multipin_nets_3d`, transposed so the
+    outer axis is the attachment round and the inner axis is the net: `tree`,
+    `unrouted`, and `paths` are in sub-grid-local coords; a net is still growing
+    while `unrouted` is non-empty and `failed` is False.
+    """
+
+    plan: NetPlan
+    region: GuideRegion
+    local_pins: list[tuple[int, int, int]]
+    tree: set[tuple[int, int, int]]
+    unrouted: set[tuple[int, int, int]]
+    paths: list[list[tuple[int, int, int]]]
+    failed: bool
+
+
 class GuideRouter:
     """Chip-scale guide-constrained router (ADR 0012 as amended).
 
@@ -268,13 +289,23 @@ class GuideRouter:
         *,
         via_cost: float = 1.0,
     ) -> list[MultiPin3DResult]:
-        """Route nets single-stream on the shared chip cost grid (Slice 2).
+        """Route in-cap nets via round-batched guide-constrained sweeps (Slice 3).
 
-        In-cap nets route sequentially in HPWL-ascending order, each on a
-        sub-grid sliced from the *current* shared `w_cur`: once a net commits,
-        its cells become `inf`, so later nets see them as obstacles and detour.
-        Cross-net conflict thus emerges from routing order — no explicit
-        conflict pass yet (rip-up lands in Slice 4). Tail nets (over-cap /
+        In-cap nets route together on the shared chip cost grid, batched by
+        *attachment round* (`docs/spikes/multi-pin-batching-strategy.md`,
+        option b). Each round, every net still missing a pin has its sub-grid
+        sliced from the *current* shared `w_cur`, prepped + committed-re-blocked
+        per net, padded to the batch's common `(L, H, W)` shape (pad = `inf`),
+        and seeded with its current tree as `extra_sources`; one
+        `sweep_sssp_3d_batched` distances them all; each slice is backtraced
+        against its own sub-grid to attach its nearest unrouted pin, growing
+        that net's tree. Rounds repeat until no net is still growing.
+
+        Nets in one round route against the **same `w_cur` snapshot** — they
+        don't see each other's commits within the round. Commits land only
+        between rounds; cross-net conflicts from same-round routing are Slice
+        4's job, not handled here. Routing order across nets is HPWL-ascending
+        (ADR 0007) within each round's commit step. Tail nets (over-cap /
         no-guide) and nets whose region doesn't contain all their pins are
         returned unrouted; the coarsened-pass fallback for the tail lands in
         Slice 5.
@@ -291,6 +322,7 @@ class GuideRouter:
         inf = float("inf")
         w_cur = self.w_chip.clone()
         w_v_cur = self.w_v_chip.clone() if self.w_v_chip is not None else None
+        device = w_cur.device
         # Tracks cells committed by earlier nets. Needed only with prep_subgrid:
         # a PDK prep (e.g. pin-access) rewrites landing-pad cells to finite,
         # which would *resurrect* a prior net's committed wire and let two nets
@@ -306,50 +338,161 @@ class GuideRouter:
         # and route-fail nets keep this sentinel — only successful routes overwrite.
         results = [MultiPin3DResult(list(pins), None) for pins in nets]
 
+        # Build the per-net work-items for the still-growing population. Each
+        # carries its region + a CPU-side mutable tree/unrouted/paths state that
+        # round-batching advances one attachment per round (transpose of the
+        # sequential tree-growth loop in route_multipin_nets_3d).
+        work: list[_NetWork] = []
         for plan in in_cap:  # HPWL-ascending
             reg = plan.region
             if not all(reg.contains(p) for p in plan.pins):
                 continue  # off-region: leave the unrouted sentinel
-            rl = (slice(reg.l0, reg.l1), slice(reg.r0, reg.r1), slice(reg.c0, reg.c1))
-            w_sub = w_cur[rl]
-            w_v_sub = w_v_cur[rl] if w_v_cur is not None else None
             local = [reg.rebase(p) for p in plan.pins]
-            if self.prep_subgrid is not None:
-                # Clone first: prep mutates in place, and w_sub is a view into
-                # the shared w_cur — prepping the view would corrupt it. prep is
-                # called on both the H and V cost grids (see PrepSubgrid).
-                assert committed is not None
-                sub_committed = committed[rl]
-                w_sub = w_sub.clone()
-                self.prep_subgrid(w_sub, local)
-                w_sub[sub_committed] = inf  # prep must not resurrect prior wires
-                if w_v_sub is not None:
-                    w_v_sub = w_v_sub.clone()
-                    self.prep_subgrid(w_v_sub, local)
-                    w_v_sub[sub_committed] = inf
-            local_res = route_multipin_nets_3d(
-                w_sub, [local], via_cost=via_cost, w_v=w_v_sub,
-            )[0]
-            if local_res.paths is None:
-                continue  # route failed: leave the unrouted sentinel
-            # Translate sub-grid-local paths to chip-global and commit the routed
-            # cells as obstacles in the shared w_cur for later nets. One batched
-            # index-assignment, not per-cell (each scalar write is a kernel
-            # launch + sync on MPS — death by O(cells-per-net) launches).
-            global_paths = [
-                [(lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in path]
-                for path in local_res.paths
-            ]
-            cells = [c for path in global_paths for c in path]
-            ls, rs, cs = (
-                torch.tensor(axis, device=w_cur.device, dtype=torch.long)
-                for axis in zip(*cells)
+            work.append(
+                _NetWork(
+                    plan=plan,
+                    region=reg,
+                    local_pins=local,
+                    tree={local[0]},
+                    unrouted=set(local[1:]),
+                    paths=[[local[0]]],
+                    failed=False,
+                )
             )
-            w_cur[ls, rs, cs] = inf
-            if w_v_cur is not None:
-                w_v_cur[ls, rs, cs] = inf
-            if committed is not None:
-                committed[ls, rs, cs] = True
-            results[plan.index] = MultiPin3DResult(list(plan.pins), global_paths)
+
+        # Round-batched attachment loop. A net is "still growing" while it has
+        # unrouted pins and hasn't failed. The same w_cur snapshot bounds every
+        # net in a round; commits land in the per-round commit step below.
+        while True:
+            active = [nw for nw in work if nw.unrouted and not nw.failed]
+            if not active:
+                break
+
+            # --- Slice + prep + committed-re-block PER NET, then pad+stack. ---
+            # prep_subgrid is per-sub-grid (it cannot run on the stacked tensor),
+            # and the committed re-block must carry into the batched path: prep
+            # rewrites landing-pad cells to finite, resurrecting prior nets'
+            # committed wires unless we re-block after prep (watch-outs 1 & 2).
+            subgrids_h: list[torch.Tensor] = []
+            subgrids_v: list[torch.Tensor] = []
+            for nw in active:
+                reg = nw.region
+                rl = (
+                    slice(reg.l0, reg.l1),
+                    slice(reg.r0, reg.r1),
+                    slice(reg.c0, reg.c1),
+                )
+                # Clone: prep mutates in place and the slice is a view into the
+                # shared w_cur — prepping the view would corrupt the snapshot.
+                w_sub = w_cur[rl].clone()
+                w_v_sub = w_v_cur[rl].clone() if w_v_cur is not None else None
+                if self.prep_subgrid is not None:
+                    assert committed is not None
+                    sub_committed = committed[rl]
+                    self.prep_subgrid(w_sub, nw.local_pins)
+                    w_sub[sub_committed] = inf  # prep must not resurrect wires
+                    if w_v_sub is not None:
+                        self.prep_subgrid(w_v_sub, nw.local_pins)
+                        w_v_sub[sub_committed] = inf
+                subgrids_h.append(w_sub)
+                if w_v_sub is not None:
+                    subgrids_v.append(w_v_sub)
+
+            lmax = max(g.shape[0] for g in subgrids_h)
+            hmax = max(g.shape[1] for g in subgrids_h)
+            wmax = max(g.shape[2] for g in subgrids_h)
+            K = len(active)
+            w_batch = torch.full(
+                (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
+            )
+            for k, g in enumerate(subgrids_h):
+                gl, gh, gw = g.shape
+                w_batch[k, :gl, :gh, :gw] = g
+            w_v_batch: torch.Tensor | None = None
+            if subgrids_v:
+                w_v_batch = torch.full(
+                    (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
+                )
+                for k, g in enumerate(subgrids_v):
+                    gl, gh, gw = g.shape
+                    w_v_batch[k, :gl, :gh, :gw] = g
+
+            # Each net's primary source is its seed pin (tree[0] == local_pins[0]);
+            # its extra_sources are the rest of its current tree. A multi-source
+            # sweep gives "distance to nearest tree cell", the attachment quantity.
+            sources = [nw.local_pins[0] for nw in active]
+            extra_sources = [
+                [c for c in nw.tree if c != nw.local_pins[0]] for nw in active
+            ]
+            d_batch, _ = sweep_sssp_3d_batched(
+                w_batch, sources, via_cost=via_cost, w_v=w_v_batch,
+                extra_sources=extra_sources,
+            )
+            d_cpu = d_batch.cpu()
+
+            # --- Per-net backtrace against its OWN sub-grid (CPU-side). ---
+            # NOTE (Slice 3 walk-back watch): this per-net CPU backtrace is the
+            # cost not amortised by the batched sweep. If it dominates the kernel
+            # saving at Hazard3 scale, that's the ADR-0012 signal to push
+            # backtrace onto the GPU or revisit batch grouping.
+            for k, nw in enumerate(active):
+                gl, gh, gw = subgrids_h[k].shape
+                d_k = d_cpu[k, :gl, :gh, :gw]
+                w_sub_cpu = subgrids_h[k].cpu()
+                w_v_sub_cpu = (
+                    subgrids_v[k].cpu() if subgrids_v else None
+                )
+                seed = nw.local_pins[0]
+                extras = extra_sources[k]  # same tree-minus-seed used for the sweep
+                best_pin: tuple[int, int, int] | None = None
+                best_dist = inf
+                for p in nw.unrouted:
+                    dp = float(d_k[p].item())
+                    if dp < best_dist:
+                        best_dist = dp
+                        best_pin = p
+                if best_pin is None or best_dist == inf:
+                    nw.failed = True
+                    continue
+                path = backtrace_3d(
+                    d_k, w_sub_cpu, seed, best_pin, via_cost=via_cost,
+                    w_v=w_v_sub_cpu, extra_sources=extras,
+                )
+                if path is None:
+                    nw.failed = True
+                    continue
+                nw.paths.append(path)
+                nw.tree.update(path)
+                nw.unrouted.discard(best_pin)
+
+            # --- Commit fully-routed nets between rounds, HPWL-ascending. ---
+            # A net is done when it has no unrouted pins left. Committing its
+            # cells to inf makes them obstacles for the *next* round's snapshot
+            # (so later-round nets detour); within-round nets shared this round's
+            # snapshot and may collide — Slice 4 resolves that. `active` is
+            # already HPWL-ascending (in_cap order is preserved through `work`).
+            for nw in active:
+                if nw.failed or nw.unrouted:
+                    continue
+                reg = nw.region
+                global_paths = [
+                    [(lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in path]
+                    for path in nw.paths
+                ]
+                cells = [c for path in global_paths for c in path]
+                # One batched index-assignment, not per-cell (each scalar write
+                # is a kernel launch + sync on MPS — death by O(cells) launches).
+                ls, rs, cs = (
+                    torch.tensor(axis, device=device, dtype=torch.long)
+                    for axis in zip(*cells)
+                )
+                w_cur[ls, rs, cs] = inf
+                if w_v_cur is not None:
+                    w_v_cur[ls, rs, cs] = inf
+                if committed is not None:
+                    committed[ls, rs, cs] = True
+                results[nw.plan.index] = MultiPin3DResult(
+                    list(nw.plan.pins), global_paths
+                )
 
         return results

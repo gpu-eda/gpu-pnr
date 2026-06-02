@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""WS3.3 GuideRouter Slice 2 validation — single-stream route on Hazard3.
+"""WS3.3 GuideRouter validation — guide-constrained route on Hazard3.
 
-The Slice 2 exit criterion (`docs/plans/ws33-tile-router-implementation.md`):
-run the guide-constrained single-stream router on a Hazard3 sample and confirm
-it reproduces the track-pitch prototype's ms/net and **0 cross-net conflicts**.
+Drives `gpu_pnr.guide_router.GuideRouter` over a Hazard3 sample and reports
+ms/net, routability, and cross-net conflicts. As of Slice 3 the router
+round-batches (`docs/plans/ws33-tile-router-implementation.md`): each
+attachment round packs all still-growing nets' sub-grids into one batched
+sweep. Nets in a round share the same `w_cur` snapshot, so same-round overlaps
+are **deferred conflicts** (Slice 4's job) — a non-zero conflict count here is
+expected pre-Slice-4, not a failure. The ms/net A/B vs the Slice 2 single-stream
+baseline lives in `docs/results.md` Phase 3.3.
 
 Unlike `track_pitch_sweep_prototype.py` (which routes each net on an
-*independent* clone), this drives `gpu_pnr.guide_router.GuideRouter`, which
-routes the sampled nets sequentially on **one shared** chip cost grid in
-HPWL-ascending order: each routed net's cells become obstacles for later nets.
-The cross-net-conflict-free property is the substrate invariant this validates
-(it is what the tile prototype first showed; here it must hold on the
-guide-constrained shared grid). Pin-access rules are injected per sub-grid via
-the router's `prep_subgrid` hook — the same `apply_pin_access_rules` the
-prototype applied, now plumbed through the PDK-agnostic router.
+*independent* clone), this drives the chip-scale router on **one shared** grid.
+Pin-access rules are injected per sub-grid via the router's `prep_subgrid` hook
+— the same `apply_pin_access_rules` the prototype applied, now plumbed through
+the PDK-agnostic router.
 
 Run:
   uv run python scripts/guide_router_hazard3.py --device cpu --sample 100
@@ -95,7 +96,7 @@ def main(argv: list[str] | None = None) -> None:
     chip_w = (xhi - xlo) // args.pitch + 1
     chip_shape = (len(LAYER_ORDER), chip_h, chip_w)
 
-    print(f"GuideRouter Slice 2 — pitch {args.pitch} DBU, device {device}",
+    print(f"GuideRouter (round-batched) — pitch {args.pitch} DBU, device {device}",
           flush=True)
     print("  building chip-scale cost grid...", flush=True)
     t0 = time.perf_counter()
@@ -157,8 +158,9 @@ def main(argv: list[str] | None = None) -> None:
     print(f"\n  routed: {len(routed)}/{len(in_cap)} in-cap "
           f"({100*len(routed)/max(len(in_cap),1):.1f}%); "
           f"tail unrouted: {len(tail)}", flush=True)
-    print(f"  CROSS-NET CONFLICTS: {conflicts}  "
-          f"({'✓ PASS' if conflicts == 0 else '✗ FAIL'})", flush=True)
+    print(f"  cross-net conflicts: {conflicts}  "
+          f"({'none' if conflicts == 0 else 'deferred to Slice 4 rip-up'})",
+          flush=True)
     print(f"  ms/net (in-cap, aggregate mean): {ms_per_incap:.2f} "
           f"(total {elapsed_ms/1000:.1f}s for {len(in_cap)} in-cap nets)",
           flush=True)
@@ -167,14 +169,15 @@ def main(argv: list[str] | None = None) -> None:
         print(f"  routed wirelength cells: median={_pct(lengths, 0.5):.0f} "
               f"p90={_pct(lengths, 0.9):.0f} max={lengths[-1]}", flush=True)
     total_s = ms_per_incap * HAZARD3_ROUTABLE_NETS / 1000.0
-    print(f"  → whole-chip single-stream extrapolation "
+    print(f"  → whole-chip extrapolation "
           f"({HAZARD3_ROUTABLE_NETS} routable): {total_s:.0f}s", flush=True)
-    print("\n  Reading: 0 cross-net conflicts is the substrate invariant "
-          "(shared-grid commit works).\n  The aggregate ms/net is a mean "
-          "(total / in-cap count); compare to the track-pitch prototype's\n  "
-          "MEAN (CPU ~16, MPS ~37 — docs/results.md Phase 3.3), not its "
-          "tail-light median.\n  Routability < 100% is honest cross-net "
-          "contention (no rip-up yet — Slice 4 recovers it).", flush=True)
+    print("\n  Reading: round-batching shares one w_cur snapshot per round, so "
+          "same-round\n  overlaps are deferred conflicts (Slice 4 rip-up "
+          "resolves them) — a non-zero\n  count here is expected, not a "
+          "failure. The aggregate ms/net is a mean\n  (total / in-cap count); "
+          "the Slice 2→3 A/B and the drt comparison live in\n  docs/results.md "
+          "Phase 3.3. Routability < 100% is honest cross-net contention.",
+          flush=True)
 
 
 if __name__ == "__main__":

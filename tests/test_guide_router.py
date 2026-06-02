@@ -200,37 +200,45 @@ def test_route_single_net_matches_direct():
     assert res.cells == ref_global
 
 
-def test_two_nets_detour_no_conflict():
-    """A second net detours around the first's committed cells via the shared
-    w_cur — both route, zero cross-net cell conflicts."""
+def test_same_round_nets_share_snapshot_no_intra_round_detour():
+    """Slice 3 semantics change vs Slice 2: nets routed in the same batch route
+    against the SAME w_cur snapshot — they do NOT see each other's commits, so
+    an overlapping net does NOT detour around a same-round net (Slice 2's
+    sequential within-batch detour is gone). Both route; resulting cross-net
+    overlap is a conflict that Slice 4's rip-up resolves — not handled here."""
     chip = torch.full((1, 5, 5), 1.0)
     guide = _full_guide(5, 5)
-    net_a = [(0, 2, 0), (0, 2, 2)]   # HPWL 2 → routes first, claims row-2 cols 0-2
-    net_b = [(0, 0, 1), (0, 4, 1)]   # HPWL 4 → must cross row 2; detours via open col
+    net_a = [(0, 2, 0), (0, 2, 2)]   # claims row-2 cols 0-2
+    net_b = [(0, 0, 1), (0, 4, 1)]   # straight col-1 path crosses row 2 at (0,2,1)
     router = GuideRouter(
         chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
     )
     res_a, res_b = router.route([net_a, net_b], [guide, guide])
+    # Both route against the same snapshot — neither is blocked by the other.
     assert res_a.routed and res_b.routed
-    assert res_a.cells.isdisjoint(res_b.cells)  # 0 cross-net conflicts
+    # They share cell (0, 2, 1): a same-round conflict, left for Slice 4.
+    assert not res_a.cells.isdisjoint(res_b.cells)
 
 
-def test_hpwl_order_decides_contention():
-    """Routing order is HPWL-ascending, not input order: on a 1-row corridor the
-    shorter net routes first and claims the shared cells, starving the longer
-    one. Input order is [long, short] to prove HPWL order wins."""
+def test_same_round_overlap_both_route_no_starvation():
+    """On a 1-row corridor two overlapping nets both route in the same round
+    (same snapshot): the longer net is NOT starved by the shorter one, because
+    within a round there is no commit-then-detour. Slice 2's HPWL contention
+    starvation is deferred to Slice 4 conflict resolution."""
     chip = torch.full((1, 1, 5), 1.0)
     guide = _full_guide(1, 5)
-    long_net = [(0, 0, 0), (0, 0, 4)]   # HPWL 4; only path crosses cols 1-3
-    short_net = [(0, 0, 1), (0, 0, 2)]  # HPWL 1; claims cols 1-2
+    long_net = [(0, 0, 0), (0, 0, 4)]   # crosses cols 1-3
+    short_net = [(0, 0, 1), (0, 0, 2)]  # claims cols 1-2
     router = GuideRouter(
         chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
     )
     res_long, res_short = router.route(
         [long_net, short_net], [guide, guide],  # input order: long first
     )
-    assert res_short.routed       # shorter HPWL → routed first
-    assert not res_long.routed    # corridor taken, no detour on one row
+    # Same snapshot → both route; the long net is no longer starved.
+    assert res_short.routed and res_long.routed
+    # Overlap on cols 1-2 — a conflict Slice 4 will resolve.
+    assert not res_long.cells.isdisjoint(res_short.cells)
     # Results are returned in input order regardless of routing order.
     assert res_long.pins == long_net and res_short.pins == short_net
 
@@ -301,6 +309,95 @@ def test_route_preserves_input_order():
     assert [r.pins for r in results] == nets
     assert results[0].routed and results[2].routed
     assert not results[1].routed  # tail
+
+
+def test_route_disjoint_nets_match_per_net_sequential():
+    """Slice 3 round-batching correctness gate: for spatially DISJOINT nets
+    (no shared sub-grid cells, no interaction), the batched route must produce
+    exactly the same committed cell set as routing each net independently on
+    its own sub-grid sliced from the same w_cur snapshot. Disjoint nets never
+    see each other's commits regardless of batching, so the cell sets must be
+    bit-identical."""
+    chip = torch.full((1, 12, 12), 1.0)
+    # Three spatially-separated nets, each with a guide bounding a small corner.
+    net_a = [(0, 0, 0), (0, 1, 2)]
+    net_b = [(0, 8, 8), (0, 10, 10)]
+    net_c = [(0, 4, 9), (0, 5, 11)]
+    nets = [net_a, net_b, net_c]
+    guides = [
+        [_rect(0, 0, 3000, 3000, "M1")],
+        [_rect(8000, 8000, 12000, 12000, "M1")],
+        [_rect(9000, 4000, 12000, 6000, "M1")],
+    ]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    results = router.route(nets, guides)
+    assert all(r.routed for r in results)
+
+    # Reference: route each net independently on its own sub-grid from the
+    # SAME original snapshot (disjoint → no cross-net commit interaction).
+    for plan_idx, (net, guide) in enumerate(zip(nets, guides)):
+        reg = guide_region(
+            guide, ORIGIN, LAYERS, PITCH, margin=4, chip_shape=(1, 12, 12),
+        )
+        assert reg is not None
+        w_sub = chip[reg.l0:reg.l1, reg.r0:reg.r1, reg.c0:reg.c1].clone()
+        local = [reg.rebase(p) for p in net]
+        [ref] = route_multipin_nets_3d(w_sub, [local])
+        ref_global = {
+            (lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in ref.cells
+        }
+        assert results[plan_idx].cells == ref_global, (
+            f"net {plan_idx}: batched cell set != per-net sequential"
+        )
+
+    # Sanity: the three committed cell sets are mutually disjoint.
+    all_cells = [r.cells for r in results]
+    for i in range(len(all_cells)):
+        for j in range(i + 1, len(all_cells)):
+            assert all_cells[i].isdisjoint(all_cells[j])
+
+
+def test_route_two_pin_and_multipin_split_both_route():
+    """Round-batching handles a mix of 2-pin and >=3-pin nets in the same
+    call: both buckets route correctly. The 2-pin net finishes in round 1;
+    the multi-pin net needs >=2 attachment rounds. Both are disjoint so they
+    must fully route with no shared cells."""
+    chip = torch.full((1, 16, 16), 1.0)
+    two_pin = [(0, 0, 0), (0, 2, 2)]
+    multi_pin = [(0, 10, 10), (0, 10, 13), (0, 13, 10), (0, 13, 13)]
+    nets = [two_pin, multi_pin]
+    guides = [
+        [_rect(0, 0, 4000, 4000, "M1")],
+        [_rect(9000, 9000, 15000, 15000, "M1")],
+    ]
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    res_two, res_multi = router.route(nets, guides)
+    assert res_two.routed and res_multi.routed
+    # The 4-pin net's tree must connect all four pins.
+    assert all(p in res_multi.cells for p in multi_pin)
+    # Disjoint nets: no shared cells.
+    assert res_two.cells.isdisjoint(res_multi.cells)
+
+    # Each must equal its own per-net sequential reference.
+    for net, guide, res in (
+        (two_pin, guides[0], res_two),
+        (multi_pin, guides[1], res_multi),
+    ):
+        reg = guide_region(
+            guide, ORIGIN, LAYERS, PITCH, margin=4, chip_shape=(1, 16, 16),
+        )
+        assert reg is not None
+        w_sub = chip[reg.l0:reg.l1, reg.r0:reg.r1, reg.c0:reg.c1].clone()
+        local = [reg.rebase(p) for p in net]
+        [ref] = route_multipin_nets_3d(w_sub, [local])
+        ref_global = {
+            (lyr + reg.l0, r + reg.r0, c + reg.c0) for (lyr, r, c) in ref.cells
+        }
+        assert res.cells == ref_global
 
 
 def test_netplan_carries_index_pins_region():

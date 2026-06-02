@@ -453,6 +453,76 @@ def test_sweep_sssp_3d_batched_variable_size_padded():
     assert torch.all(torch.isinf(d_batched.cpu()[obstacle.cpu()]))
 
 
+def test_sweep_sssp_3d_batched_extra_sources_matches_per_grid():
+    """Per-net `extra_sources` in the batched kernel must match a per-net
+    single-source-with-extra_sources sweep (the multi-pin tree-seed case
+    round-batching needs). Each net seeds its own primary source PLUS its own
+    extra-source set at distance 0; the oracle is `sweep_sssp_3d`'s already-
+    validated extra_sources path."""
+    torch.manual_seed(50)
+    K, L, H, W = 4, 3, 10, 10
+    via_cost = 0.6
+    grids = []
+    sources = []
+    extra_sources = []
+    for k in range(K):
+        wk = torch.rand(L, H, W) + 0.1
+        wk[k % L, (k * 2) % H, :] = math.inf
+        grids.append(wk)
+        sources.append((0, k % H, (2 * k) % W))
+        # A distinct extra-source set per net (the net's prior tree cells).
+        extra_sources.append([
+            (0, (k + 3) % H, (k + 1) % W),
+            (L - 1, (k + 5) % H, (3 * k) % W),
+        ])
+    w_batch = torch.stack(grids, dim=0)
+    d_batched, _ = sweep_sssp_3d_batched(
+        w_batch, sources, via_cost=via_cost, extra_sources=extra_sources
+    )
+    assert d_batched.shape == (K, L, H, W)
+    for k in range(K):
+        d_single, _ = sweep_sssp_3d(
+            grids[k], sources[k], via_cost=via_cost,
+            extra_sources=extra_sources[k],
+        )
+        finite = torch.isfinite(d_single)
+        assert torch.allclose(
+            d_batched[k].cpu()[finite], d_single.cpu()[finite], atol=5e-2
+        ), f"net {k}: batched-with-extra_sources diverges from single-grid"
+        # Every extra source of net k must survive at d=0 in net k's slice.
+        for e in extra_sources[k]:
+            if torch.isfinite(grids[k][e]):
+                assert float(d_batched[k][e]) == 0.0
+
+
+def test_sweep_sssp_3d_batched_extra_sources_default_empty():
+    """Default-empty `extra_sources` leaves the batched kernel identical to
+    the no-extra-sources call — the back-compat guarantee for Slice 3 (all
+    existing batched tests must stay green)."""
+    torch.manual_seed(51)
+    K, L, H, W = 3, 2, 8, 8
+    via_cost = 0.5
+    grids = [torch.rand(L, H, W) + 0.1 for _ in range(K)]
+    sources = [(0, k, k) for k in range(K)]
+    w_batch = torch.stack(grids, dim=0)
+    d_no_arg, _ = sweep_sssp_3d_batched(w_batch, sources, via_cost=via_cost)
+    d_empty, _ = sweep_sssp_3d_batched(
+        w_batch, sources, via_cost=via_cost, extra_sources=()
+    )
+    finite = torch.isfinite(d_no_arg)
+    assert torch.equal(d_no_arg[finite], d_empty[finite])
+
+
+def test_sweep_sssp_3d_batched_extra_sources_length_check():
+    """When given, `extra_sources` must carry one entry per net (length K)."""
+    w_batch = torch.rand(3, 2, 6, 6) + 0.1
+    sources = [(0, 0, 0), (0, 1, 1), (0, 2, 2)]
+    with pytest.raises(ValueError, match="extra_sources"):
+        sweep_sssp_3d_batched(
+            w_batch, sources, extra_sources=[[(0, 0, 0)]],  # only 1, need 3
+        )
+
+
 def test_sweep_sssp_3d_batched_anisotropic_matches_per_grid():
     """Per-net anisotropy (each net its own w_v) still tracks single-grid."""
     torch.manual_seed(42)

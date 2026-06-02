@@ -585,6 +585,7 @@ def sweep_sssp_3d_batched(
     check_every: int = 8,
     seg_barrier: float | None = None,
     w_v: torch.Tensor | None = None,
+    extra_sources: Sequence[Sequence[tuple[int, int, int]]] = (),
 ) -> tuple[torch.Tensor, int]:
     """Sweep K *independent* per-net grids in one fused kernel call.
 
@@ -618,6 +619,14 @@ def sweep_sssp_3d_batched(
             when every net's slice has converged (slowest net bounds the call).
         seg_barrier: optional override; otherwise autotuned from the batch.
         w_v: optional (K, L, H, W) cost tensor for axis=1 ("V") moves.
+        extra_sources: optional per-net list of additional source cells to
+            seed at distance 0, beyond each net's primary `source`. Either
+            empty (the default — no extras, equivalent to single-source per
+            net) or a length-K sequence, one source-set per net in that net's
+            own grid coords. This is the batched analogue of `sweep_sssp_3d`'s
+            `extra_sources`: round-batching passes each net's already-committed
+            tree cells as its extra sources, so each slice computes "distance
+            to the nearest tree cell" for picking the next attachment edge.
 
     Returns:
         (d, iters) where d is (K, L, H, W).
@@ -629,13 +638,36 @@ def sweep_sssp_3d_batched(
         raise ValueError(
             f"expected {K} sources (one per net), got {len(sources)}"
         )
+    if extra_sources and len(extra_sources) != K:
+        raise ValueError(
+            f"extra_sources, when given, must have one set per net "
+            f"(length {K}); got {len(extra_sources)}"
+        )
     via_costs = _normalize_via_cost(via_cost, L, w.device, w.dtype)
     # Materialise as Python floats once; see `sweep_sssp_3d` comment +
     # docs/spikes/tier-b-envelope-throughput.md for the perf rationale.
     vc_f: list[float] = via_costs.tolist()
     d = torch.full((K, L, H, W), float("inf"), device=w.device, dtype=w.dtype)
-    for k, (sl, sr, sc) in enumerate(sources):
-        d[k, sl, sr, sc] = 0.0
+    # Seed every primary source + every per-net extra source at d=0 in ONE
+    # batched index-assignment. Per-cell scalar writes are a kernel launch +
+    # sync each on MPS (death by O(seeds) launches for the round-batched
+    # tree-as-sources case); gather all (k, l, r, c) indices and assign once.
+    seed_k: list[int] = list(range(K))
+    seed_l = [sl for (sl, _, _) in sources]
+    seed_r = [sr for (_, sr, _) in sources]
+    seed_c = [sc for (_, _, sc) in sources]
+    if extra_sources:
+        for k, extras in enumerate(extra_sources):
+            for el, er, ec in extras:
+                seed_k.append(k)
+                seed_l.append(el)
+                seed_r.append(er)
+                seed_c.append(ec)
+    ks = torch.tensor(seed_k, device=w.device, dtype=torch.long)
+    ls = torch.tensor(seed_l, device=w.device, dtype=torch.long)
+    rs = torch.tensor(seed_r, device=w.device, dtype=torch.long)
+    cs = torch.tensor(seed_c, device=w.device, dtype=torch.long)
+    d[ks, ls, rs, cs] = 0.0
     mask_h = _obstacle_mask(w)
     if w_v is not None:
         mask_v = _obstacle_mask(w_v)
