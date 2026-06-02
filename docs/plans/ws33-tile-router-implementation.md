@@ -144,7 +144,24 @@ constants into `_hazard3_io.py` before another script needs them.
 
 ---
 
-### Slice 3 — Batched routing via `sweep_sssp_3d_batched`
+### Slice 3 — Batched routing via `sweep_sssp_3d_batched` ✅ DONE
+
+**Landed** in `GuideRouter.route` (round-batched loop + `_NetWork`) +
+`sweep_sssp_3d_batched` per-net `extra_sources` + `scripts/drt_compare.py`
+(5 new tests; suite 106 → 111). Exit criterion met: **MPS 32.1 ms/net vs
+Slice 2's 43.0 — 1.34× faster** (`docs/results.md` Phase 3.3 "Slice 3"). Below
+the kernel spike's 2.46–4.05× because heterogeneous sub-grids force
+padding-to-max waste (size-bucketing, the deferred Am4 lever, recovers it).
+CPU regresses 11.4× (no parallelism to hide the padding) → **device-aware
+dispatch** follow-up. Rough net-matched vs OpenROAD drt: wirelength 1.003×
+aggregate (inside the ≤1.2× Slice 6 gate on the in-cap subset), vias 0.453×
+(partly model artifact) — orientation only, real gate is Slice 6.
+
+**Carried follow-ups:** (1) device-aware dispatch (sequential on CPU); (2)
+vectorise the per-pin backtrace argmin + hoist per-net `.cpu()` (the walk-back
+watch — profile in Slice 6); (3) extract a shared `attach_nearest_pin` helper
+between `route_multipin_nets_3d` and the round loop; (4) `drt_compare.py` adds
+a 4th copy of the net-sampling loop the handoff already tracks.
 
 **Deliverable:** replace the sequential per-net sweep with batched groups.
 Collect K independent in-cap nets, pad+stack their sub-grids (Amendment 4's
