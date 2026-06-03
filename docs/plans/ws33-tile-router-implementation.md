@@ -170,9 +170,13 @@ initial pass** (3.07 ms/net; not ahead — `results.md` like-for-like). Quality
 **Carried follow-ups:** (1) **the per-net CPU backtrace is now the top
 throughput cost** (~60% of the bucketed router) — within uniform-shaped buckets
 the best-pin argmin vectorises (gather + `torch.min`); on-GPU backtrace beyond
-that; (2) pick a default `bucket_size` and drop the `bucket_size=None` A/B path;
-(3) convergence-masking (slowest-net-bounds-batch); (4) extract a shared
-`attach_nearest_pin` helper; (5) `drt_compare.py` 4th net-sampling copy →
+that; (2) **search-space (the drt ~3.8× gap)** — goal-bounding the region is a
+cheap, safe but *modest* ~1.2× lever ([`../spikes/goal-bounded-sweep.md`](../spikes/goal-bounded-sweep.md));
+the real lever is **goal-biased expansion** (A*-style f-band, not GA* —
+[`../spikes/gpu-astar-evaluation.md`](../spikes/gpu-astar-evaluation.md)), its
+own spike; (3) pick a default `bucket_size` and drop the `bucket_size=None` A/B
+path; (4) convergence-masking (slowest-net-bounds-batch); (5) extract a shared
+`attach_nearest_pin` helper; (6) `drt_compare.py` 4th net-sampling copy →
 `sample_nets`.
 
 **Deliverable:** replace the sequential per-net sweep with batched groups.
