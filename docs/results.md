@@ -1085,21 +1085,48 @@ barely used. Two compounding causes:
    is many tiny eager Metal dispatches (4 axis sweeps + L via-relaxes ×
    ~200 iters) with per-iteration sync. The GPU is starved regardless of padding.
 
-**Conclusion (ADR 0012 Amendment 5):** round-batching as built is not the MPS
-throughput path — it's slower than sequential CPU routing *and* OpenROAD drt at
-realistic scale. The fixes, priority order: (a) on-GPU backtrace +
-convergence-masking to kill the 71% bubbles (the GPU is idle 95% of the time);
-(b) size-bucketing to shrink the ~1 GB transfers. The absolute speed case is
-deferred to the CUDA/scale endgame (ADR 0001). Slices 4–6 proceed on
-correctness; this is a *throughput* walk-back, not an architecture one.
+**Conclusion (ADR 0012 Amendment 5):** round-batching *as first built* (one
+giant batch per round) is not the MPS throughput path. **But the cause is
+padding, not bubbles — and size-bucketing fixes it (next section).** The "GPU
+~5% / 71% bubble" read above was a 35 s window of the 365 s run that
+mis-attributed the cost; the giant-batch *sweep* alone was ~290 s of it.
+
+## Size-bucketing — the fix (corrects the section above)
+
+The collapse is padding-to-max waste: a round pads every net to its largest
+sub-grid. **Size-bucketing** — sort the round's nets by sub-grid size, chunk
+into K-net buckets, pad within a bucket only (`GuideRouter(bucket_size=K)`) —
+removes it. Hazard3, sample 1000, seed 0, M4 Pro MPS:
+
+| `GuideRouter.route` | ms/net | whole-chip | routed | conflicts |
+|---|---:|---:|---:|---:|
+| giant batch (`bucket_size=None`) | 262–391 | ~134 min | 853/935 | 1587 |
+| **size-bucketed (K=16)** | **11.76** | **~4 min** | 853/935 | 1587 |
+
+- **22–33× faster end-to-end, routes bit-identical** (same routed count, same
+  1587 deferred conflicts; pinned by `test_bucketed_route_identical_to_single_batch`).
+  The giant batch's 262–391 spread is run-to-run variance from the ~1 GB tensor
+  thrash; bucketed is stable.
+- Sweep-level (`batched_sweep_prototype`): bucketing cuts padding waste **31× →
+  1.0×** and the sweep **70×** (310.88 → 4.42 ms/net), beating sequential 4.9×.
+- The bucketed MPS router is now **3.4× faster than sequential** (~40 ms/net) and
+  **~2.5× faster than OpenROAD drt per-net** (~30 ms/net); whole-chip ~4 min vs
+  drt ~12 (in-cap only, no rip-up/tail/DRC — throughput, not the complete claim).
+
+**This reversed ADR 0013's pause (Amendment 1).** WS3.3 resumed on MPS,
+throughput-competitive with drt. The *next* bottleneck is the per-net CPU
+backtrace (~60% of the bucketed router) — vectorisable per uniform bucket, then
+on-GPU. Full spike: [`size-bucketed-batching.md`](spikes/size-bucketed-batching.md).
 
 ## Reproduce (Slice 3)
 
 ```sh
-uv run python scripts/guide_router_hazard3.py --device mps --sample 100   # round-batched
-uv run python scripts/guide_router_hazard3.py --device mps --sample 1000  # scaling collapse
-uv run python scripts/track_pitch_sweep_prototype.py --device mps --sample 1000  # flat sequential
-uv run python scripts/drt_compare.py --device mps --sample 300            # vs drt + exec-time
+uv run python scripts/guide_router_hazard3.py --device mps --sample 1000            # giant-batch collapse
+uv run python scripts/guide_router_hazard3.py --device mps --sample 1000 --bucket 16  # size-bucketed fix (22-33×)
+uv run python scripts/batched_sweep_prototype.py --device mps --sample 1000 --batch 16 --sort-by-size  # bucketed sweep
+uv run python scripts/batched_sweep_prototype.py --device mps --sample 1000 --batch 1000              # giant-batch sweep
+uv run python scripts/track_pitch_sweep_prototype.py --device mps --sample 1000     # flat sequential
+uv run python scripts/drt_compare.py --device mps --sample 300                      # vs drt + exec-time
 # Profile (CPU vs GPU): Metal System Trace → profiler_correlated_timeline
 xctrace record --template "Metal System Trace" --output /tmp/route.trace --time-limit 35s \
   --launch -- .venv/bin/python3 scripts/guide_router_hazard3.py --device mps --sample 1000

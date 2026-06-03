@@ -1,11 +1,11 @@
 # Plan — WS3.3 guide-constrained router implementation
 
-**Status: CLOSED — paused (2026-06-02, [ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md)).**
-Slices 1–3 landed and are correctness-validated; Slice 3's measurement showed
-round-batching is 1–11× slower than drt on MPS (GPU bubble-bound, ADR 0012
-Am5), so Slices 4–6 are **not being built on MPS**. E5 throughput is reframed
-as a CUDA experiment (ADR 0013). This plan is retained as the record of what
-was built and why it stopped; resume only under a CUDA workstream.
+**Status: ACTIVE (2026-06-03).** Slices 1–3 + **size-bucketing** landed. The
+brief 2026-06-02 pause ([ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md))
+was reversed (Am1): Slice 3's collapse was padding-to-max waste, and
+size-bucketing makes the router **22–33× faster, routes bit-identical**
+([`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md)) —
+now ~2.5× faster than drt per-net. **Slice 4 (rip-up) is next.**
 
 Supersedes the 8-slice fixed-tile + K=100 + halo plan (in `git log` before
 2026-06-01), which [ADR 0012](../adr/0012-tile-decomposition.md) Amendments
@@ -156,23 +156,22 @@ constants into `_hazard3_io.py` before another script needs them.
 **Landed** in `GuideRouter.route` (round-batched loop + `_NetWork`) +
 `sweep_sssp_3d_batched` per-net `extra_sources` + `scripts/drt_compare.py`
 (5 new tests; suite 106 → 111). Correctness gate passes (disjoint == per-net
-sequential). **Throughput walk-back — ADR 0012 Amendment 5:** the sample-100
-1.34× MPS win is a small-batch artifact. At sample 1000 round-batched ms/net
-collapses to 391 (vs flat ~40 sequential) — **~9.8× slower than sequential,
-~11× slower than OpenROAD drt** whole-chip. A Metal System Trace shows **GPU
-~5% utilised, 71% pipeline bubbles**: padding-poison (~1 GB `d_batch`
-transfers) + per-net CPU backtrace starve the GPU. Size-bucketing +
-convergence-masking are now prerequisites, not deferred levers. Full data:
-`docs/results.md` Phase 3.3 "Slice 3 … execution-time reckoning". Rough vs drt
-quality (small sample): wirelength 1.003×, vias 0.453× — orientation only.
+sequential). The initial round-batched router collapsed at scale (sample-1000
+391 ms/net, ADR 0012 Am5) — but that was **padding-to-max waste**, fixed by
+**size-bucketing** (`bucket_size` on `GuideRouter`): each round's nets are
+size-sorted and chunked so a small net isn't padded to the round's largest.
+**Result: 22–33× faster end-to-end (11.76 ms/net), routes bit-identical**
+([`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md),
+ADR 0013 Am1) — now ~2.5× faster than drt per-net. Quality (small sample) vs
+drt: wirelength 1.003×, vias 0.453×. Full data: `docs/results.md` Phase 3.3.
 
-**Carried follow-ups (the throughput fixes, priority order):** (1) **kill the
-pipeline bubbles** — on-GPU backtrace + convergence-masking (the GPU is idle
-95%); (2) **size-bucketing** — stop padding small nets to the batch max; (3)
-device-aware dispatch (sequential on CPU, where batching strictly loses); (4)
-extract a shared `attach_nearest_pin` helper; (5) `drt_compare.py` adds a 4th
-copy of the net-sampling loop the handoff tracks. Absolute speed deferred to
-CUDA/scale (ADR 0001); Slices 4–6 proceed on correctness.
+**Carried follow-ups:** (1) **the per-net CPU backtrace is now the top
+throughput cost** (~60% of the bucketed router) — within uniform-shaped buckets
+the best-pin argmin vectorises (gather + `torch.min`); on-GPU backtrace beyond
+that; (2) pick a default `bucket_size` and drop the `bucket_size=None` A/B path;
+(3) convergence-masking (slowest-net-bounds-batch); (4) extract a shared
+`attach_nearest_pin` helper; (5) `drt_compare.py` 4th net-sampling copy →
+`sample_nets`.
 
 **Deliverable:** replace the sequential per-net sweep with batched groups.
 Collect K independent in-cap nets, pad+stack their sub-grids (Amendment 4's

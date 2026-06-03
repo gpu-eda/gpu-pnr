@@ -1,6 +1,10 @@
 # ADR 0013 — Pause E5 detailed-routing throughput work on MPS
 
-**Status:** Accepted (2026-06-02).
+**Status:** Accepted (2026-06-02); **REVERSED by Amendment 1 (2026-06-03)** —
+the pause rested on the *un-bucketed* router; size-bucketing makes the MPS
+router 22–33× faster and throughput-competitive with drt. Read the original
+decision below as superseded; the critical-learnings retrospective stands
+(with the correction in Amendment 1).
 
 ## Context
 
@@ -143,8 +147,70 @@ more E5 throughput. Do not resume WS3.3 Slices 4–6 on MPS.
   Amendment 5 already records the throughput walk-back. Nothing in ADR 0012 is
   reverted.
 
+## Amendment 1 (2026-06-03): pause reversed — the collapse was padding, and padding has a cheap MPS fix
+
+The pause above rested on the round-batched router measuring 262–391 ms/net at
+sample 1000. That measurement was on the **un-bucketed** router — one giant
+batch per round, padding every net to the round's largest sub-grid.
+[`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md)
+size-buckets the round (group similar-sized nets, pad within a bucket only) and
+measures the result:
+
+- **End-to-end: 262–391 → 11.76 ms/net (22–33× faster), routing bit-identical**
+  (same 853/935 routed, same 1587 deferred conflicts; pinned by a test). The
+  bucketed MPS router is now **3.4× faster than sequential** and **~2.5× faster
+  than OpenROAD drt per-net**; whole-chip ~4 min vs drt's ~12.
+- Sweep-level: bucketing cuts padding waste 31× → 1.0× and the sweep 70×
+  (310.88 → 4.42 ms/net), beating sequential 4.9×.
+
+**This reverses the pause.** The decision rests below on three "falsified
+assumptions"; the spike shows two of the three were **measurement artifacts of
+the giant batch**, not properties of the approach:
+
+1. *"Real guide regions are 4k–252k cells, not ~3k"* — still true, but **not
+   fatal**: bucketing means a 252k-cell net no longer pads the 4k-cell nets
+   beside it. Heterogeneity is handled, not poisonous.
+2. *"GPU ~5%, 71% pipeline bubbles, backtrace-bound"* — **wrong cause.** That
+   profile was a 35 s window of the 365 s run; the giant-batch *sweep* alone was
+   ~290 s of it (a ~1 GB padded tensor thrashing MPS reads as "bubbles"). The
+   router was ~80% padding, ~20% backtrace.
+3. *"Batching is counterproductive"* — **inverted.** Batching is the win *when
+   bucketed*; the giant all-nets batch was the disease, not batching.
+
+**The honest meta-lesson:** ADR 0013 committed the very error it accused the
+gpu-vs-drt spike of — drawing an end-to-end conclusion from an incomplete
+measurement (a 35 s profile window + the un-bucketed router). "Verify, don't
+assume" applies to walk-backs too. The decision to *pause and write up* was
+cheap and correct; the *conclusion* ("MPS can't win, fixes are CUDA-shaped")
+was premature by one optimization.
+
+### What changes
+
+- **WS3.3 resumes on MPS.** The throughput basis for pausing is gone. Slices 4
+  (rip-up), 5 (tail), 6 (chip-scale gate) proceed as correctness work, now on a
+  router that is throughput-competitive with drt.
+- **Size-bucketing is a WS3.3 deliverable**, not a deferred lever (it is the
+  difference between 4 min and 134 min). The `bucket_size=None` giant-batch path
+  stays only as A/B scaffolding until a default is chosen.
+- **The next throughput lever is the per-net CPU backtrace** (~60% of the
+  bucketed router's time). Within uniform-shaped buckets the best-pin argmin
+  vectorises (gather + `torch.min`); on-GPU backtrace is the step beyond — *that*
+  part of the "CUDA-shaped" framing survives, scoped to backtrace only.
+
+### What still stands from the original decision
+
+- The **critical-learnings retrospective** (the gpu-vs-drt projection was wrong
+  on per-net search-space arithmetic) — bucketing fixes the *consequence*, but
+  the projection's ~0.16 ms/net was still baseless; the real number is ~12.
+- The **CUDA follow-up experiments** (E5-on-CUDA / E1 cuOpt, gated on a dispatch
+  probe; E2 pin-access as MPS-viable) — unchanged; CUDA remains the path to a
+  *decisive* win and to the backtrace fix. E5-on-MPS is now "competitive," which
+  raises the bar for what CUDA must beat.
+
 ## Links
 
+- [`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md)
+  — the reversal measurement (Amendment 1).
 - [`../spikes/gpu-vs-drt-throughput.md`](../spikes/gpu-vs-drt-throughput.md)
   — the falsified projection (now Resolved-negative).
 - [ADR 0012](0012-tile-decomposition.md) Amendment 5 — the throughput

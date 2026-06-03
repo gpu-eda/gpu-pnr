@@ -206,13 +206,14 @@ twice. WS3.3 is the right next step.
 
 ### WS3.3 — Guide-constrained sweep (was: tile decomposition)
 
-**Status: PAUSED (2026-06-02, [ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md)).**
-Slices 1–3 landed; Slice 3's end-to-end measurement showed round-batched
-routing is **1–11× slower than drt on MPS** (GPU ~5% utilised, bubble-bound —
-ADR 0012 Am5), falsifying the [`gpu-vs-drt-throughput`](../spikes/gpu-vs-drt-throughput.md)
-projection that justified the workstream. Slices 4–6 are **not being built on
-MPS**; E5 throughput is reframed as a CUDA experiment (ADR 0013). The
-correctness-validated code stays. History below is retained for the record.
+**Status: ACTIVE — resumed (2026-06-03).** Briefly paused 2026-06-02
+([ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md)) when the
+*un-bucketed* round-batched router measured 1–11× slower than drt — but that
+collapse was padding-to-max waste, and **size-bucketing fixes it: 22–33× faster
+end-to-end, routes bit-identical** ([`size-bucketed-batching`](../spikes/size-bucketed-batching.md),
+ADR 0013 Am1). The bucketed MPS router is now ~2.5× faster than drt per-net.
+Slices 1–3 + size-bucketing landed; **Slice 4 (rip-up) is next**. The remaining
+WS3.3 gates are correctness (Slices 4–6), not throughput.
 
 [ADR 0012](../adr/0012-tile-decomposition.md) Accepted
 2026-05-14, then **pivoted by Amendments 1–4** (2026-05-28/29): the
@@ -265,28 +266,26 @@ single-stream baseline → batched routing → conflict detect/ripup (unlocks
 [ADR 0008](../adr/0008-defer-route-nets-batched.md)) → coarsened tail →
 terminal Hazard3 + 4096² gate.
 
-**Exit criteria for WS3.3 — NOT MET, not being pursued on MPS (ADR 0013):**
+**Exit criteria for WS3.3 (throughput now in hand; correctness remains):**
 
-- [ ] ~~A 4096² grid routed by guide-constrained sweep, no quality regression~~
-      — correctness gate met at small scale (Slice 3), but the workstream is
-      paused before the full gate.
-- [ ] ~~Whole-chip Hazard3 competitive with TritonRoute (≤1.2× wire/vias)~~ —
-      *quality* is on track (wire ~1.00×, vias ~0.45× on routed nets), but
-      *throughput* is 1–11× slower on MPS. The throughput half is reframed as a
-      CUDA experiment.
+- [ ] A 4096² grid routed by guide-constrained sweep, no quality regression —
+      correctness gate met at small scale (Slice 3); full gate is Slice 6.
+- [~] Whole-chip Hazard3 competitive with TritonRoute (≤1.2× wire/vias). On the
+      in-cap set: **quality** wire ~1.00× / vias ~0.45×, **throughput** ~2.5×
+      faster than drt per-net after size-bucketing (ADR 0013 Am1). Remaining for
+      the *complete* claim: rip-up (Slice 4) → 100% + DRC, and the tail (Slice 5).
 
 ## Phase 3 exit criteria
 
-WS3.2 is shipped; WS3.3 is **paused on MPS** (ADR 0013), so this plan does not
-close on its original terms. The throughput goal moves to a CUDA-gated
-successor; the quality and correctness results stand. Status:
+WS3.2 is shipped; WS3.3 is **active again** (ADR 0013 Am1 reversed the pause).
+Status:
 
 - [x] WS3.2 fully shipped (preferred direction, multi-pin, per-via-pair).
-- [~] WS3.3 — Slices 1–3 landed (classification, single-stream, round-batched);
-      Slices 4–6 paused (ADR 0013). E5 throughput → CUDA.
+- [~] WS3.3 — Slices 1–3 + size-bucketing landed (throughput competitive with
+      drt); Slices 4–6 (rip-up, tail, chip-scale gate) next.
 - [x] TritonRoute comparison numbers documented in
-      [`../results.md`](../results.md) (Phase 3.2 quality, Phase 3.3
-      throughput + the negative drt execution-time result).
+      [`../results.md`](../results.md) (Phase 3.2 quality; Phase 3.3 throughput,
+      the giant-batch collapse, and the size-bucketing recovery).
 - [ ] Phase 4 sketches (DRC kernel co-iteration, CUDA port, E1 cuOpt) promoted
       to a successor plan — informed by ADR 0013's follow-up experiments.
 
