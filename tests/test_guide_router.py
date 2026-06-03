@@ -400,6 +400,50 @@ def test_route_two_pin_and_multipin_split_both_route():
         assert res.cells == ref_global
 
 
+def test_bucketed_route_identical_to_single_batch():
+    """Size-bucketing is a pure throughput optimisation: grouping a round's
+    nets into size-sorted buckets (vs one giant padded batch) must produce
+    byte-identical routes. Every bucket shares the round's w_cur snapshot and
+    commit stays HPWL-ordered, so bucket_size changes only padding/grouping,
+    never which cells a net claims."""
+    chip = torch.full((1, 16, 16), 1.0)
+    # Differently-sized nets so bucket_size=2 yields >1 bucket of unequal grids.
+    nets = [
+        [(0, 0, 0), (0, 1, 1)],                       # tiny
+        [(0, 8, 8), (0, 11, 11), (0, 9, 13)],         # multi-pin, larger
+        [(0, 4, 0), (0, 6, 2)],                       # small
+        [(0, 13, 1), (0, 15, 4), (0, 14, 6)],         # multi-pin
+    ]
+    guides = [
+        [_rect(0, 0, 2000, 2000, "M1")],
+        [_rect(8000, 8000, 14000, 14000, "M1")],
+        [_rect(0, 4000, 3000, 7000, "M1")],
+        [_rect(1000, 13000, 7000, 16000, "M1")],
+    ]
+    single = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+        bucket_size=None,
+    ).route(nets, guides)
+    bucketed = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+        bucket_size=2,
+    ).route(nets, guides)
+
+    assert [r.routed for r in single] == [r.routed for r in bucketed]
+    for i, (s, b) in enumerate(zip(single, bucketed)):
+        assert s.cells == b.cells, f"net {i}: bucketed route diverges from single batch"
+
+
+def test_bucket_size_must_be_positive():
+    """bucket_size, when given, must be a positive count."""
+    chip = torch.full((1, 8, 8), 1.0)
+    with pytest.raises(ValueError, match="bucket_size"):
+        GuideRouter(
+            chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH,
+            bucket_size=0,
+        )
+
+
 def test_netplan_carries_index_pins_region():
     """NetPlan exposes the fields downstream slices route from."""
     small = [_rect(0, 0, 5000, 5000, "M1")]

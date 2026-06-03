@@ -249,11 +249,14 @@ class GuideRouter:
         chip_shape: tuple[int, int, int] | None = None,
         axis_cap: int = DEFAULT_AXIS_CAP,
         prep_subgrid: PrepSubgrid | None = None,
+        bucket_size: int | None = None,
     ) -> None:
         if pitch_dbu <= 0:
             raise ValueError(f"pitch_dbu must be positive; got {pitch_dbu}")
         if axis_cap <= 0:
             raise ValueError(f"axis_cap must be positive; got {axis_cap}")
+        if bucket_size is not None and bucket_size <= 0:
+            raise ValueError(f"bucket_size must be positive; got {bucket_size}")
         self.w_chip = w_chip
         self.w_v_chip = w_v_chip
         self.chip_origin = chip_origin
@@ -262,6 +265,7 @@ class GuideRouter:
         self.margin = margin
         self.axis_cap = axis_cap
         self.prep_subgrid = prep_subgrid
+        self.bucket_size = bucket_size
         if chip_shape is not None:
             self.chip_shape: tuple[int, int, int] | None = chip_shape
         elif w_chip is not None:
@@ -282,6 +286,125 @@ class GuideRouter:
             axis_cap=self.axis_cap,
         )
 
+    def _attach_batch(
+        self,
+        batch: list[_NetWork],
+        w_cur: torch.Tensor,
+        w_v_cur: torch.Tensor | None,
+        committed: torch.Tensor | None,
+        via_cost: float,
+    ) -> None:
+        """One batched sweep + backtrace over `batch`, growing each net's tree
+        by one attachment. Slices each net's sub-grid from the shared `w_cur`
+        snapshot, applies `prep_subgrid` + the committed re-block per net, pads
+        to the batch's common `(L,H,W)`, runs one `sweep_sssp_3d_batched`, and
+        backtraces each slice against its own sub-grid. Mutates each `_NetWork`
+        in place (grows `tree`/`paths`, shrinks `unrouted`, or sets `failed`).
+
+        Callers bucket `batch` by sub-grid size: padding every net to the
+        batch's largest sub-grid wastes ~31× cells when sizes are mixed, which
+        made one-giant-batch routing 70× slower than size-bucketed at the sweep
+        level (`docs/spikes/size-bucketed-batching.md`).
+        """
+        inf = float("inf")
+        device = w_cur.device
+        # Slice + prep + committed-re-block PER NET, then pad+stack. prep_subgrid
+        # is per-sub-grid (it cannot run on the stacked tensor), and the committed
+        # re-block must carry into the batched path: prep rewrites landing-pad
+        # cells to finite, resurrecting prior nets' committed wires unless we
+        # re-block after prep (watch-outs 1 & 2).
+        subgrids_h: list[torch.Tensor] = []
+        subgrids_v: list[torch.Tensor] = []
+        for nw in batch:
+            reg = nw.region
+            rl = (
+                slice(reg.l0, reg.l1),
+                slice(reg.r0, reg.r1),
+                slice(reg.c0, reg.c1),
+            )
+            # Clone: prep mutates in place and the slice is a view into the
+            # shared w_cur — prepping the view would corrupt the snapshot.
+            w_sub = w_cur[rl].clone()
+            w_v_sub = w_v_cur[rl].clone() if w_v_cur is not None else None
+            if self.prep_subgrid is not None:
+                assert committed is not None
+                sub_committed = committed[rl]
+                self.prep_subgrid(w_sub, nw.local_pins)
+                w_sub[sub_committed] = inf  # prep must not resurrect wires
+                if w_v_sub is not None:
+                    self.prep_subgrid(w_v_sub, nw.local_pins)
+                    w_v_sub[sub_committed] = inf
+            subgrids_h.append(w_sub)
+            if w_v_sub is not None:
+                subgrids_v.append(w_v_sub)
+
+        lmax = max(g.shape[0] for g in subgrids_h)
+        hmax = max(g.shape[1] for g in subgrids_h)
+        wmax = max(g.shape[2] for g in subgrids_h)
+        K = len(batch)
+        w_batch = torch.full(
+            (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
+        )
+        for k, g in enumerate(subgrids_h):
+            gl, gh, gw = g.shape
+            w_batch[k, :gl, :gh, :gw] = g
+        w_v_batch: torch.Tensor | None = None
+        if subgrids_v:
+            w_v_batch = torch.full(
+                (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
+            )
+            for k, g in enumerate(subgrids_v):
+                gl, gh, gw = g.shape
+                w_v_batch[k, :gl, :gh, :gw] = g
+
+        # Each net's primary source is its seed pin (tree[0] == local_pins[0]);
+        # its extra_sources are the rest of its current tree. A multi-source
+        # sweep gives "distance to nearest tree cell", the attachment quantity.
+        sources = [nw.local_pins[0] for nw in batch]
+        extra_sources = [
+            [c for c in nw.tree if c != nw.local_pins[0]] for nw in batch
+        ]
+        d_batch, _ = sweep_sssp_3d_batched(
+            w_batch, sources, via_cost=via_cost, w_v=w_v_batch,
+            extra_sources=extra_sources,
+        )
+        d_cpu = d_batch.cpu()
+
+        # Per-net backtrace against its OWN sub-grid (CPU-side).
+        # NOTE (post-bucketing bottleneck): with size-bucketing removing the
+        # padding waste, this serial CPU backtrace — per-net `.cpu()` + the
+        # per-pin `.item()` argmin — is the *next* dominant cost. Within a bucket
+        # the slices are uniform-shaped, so the best-pin search vectorises to one
+        # gather + `torch.min` per bucket; pushing backtrace onto the GPU is the
+        # ADR-0012 lever beyond that. See ADR 0013 + docs/spikes/size-bucketed-batching.md.
+        for k, nw in enumerate(batch):
+            gl, gh, gw = subgrids_h[k].shape
+            d_k = d_cpu[k, :gl, :gh, :gw]
+            w_sub_cpu = subgrids_h[k].cpu()
+            w_v_sub_cpu = subgrids_v[k].cpu() if subgrids_v else None
+            seed = nw.local_pins[0]
+            extras = extra_sources[k]  # same tree-minus-seed used for the sweep
+            best_pin: tuple[int, int, int] | None = None
+            best_dist = inf
+            for p in nw.unrouted:
+                dp = float(d_k[p].item())
+                if dp < best_dist:
+                    best_dist = dp
+                    best_pin = p
+            if best_pin is None or best_dist == inf:
+                nw.failed = True
+                continue
+            path = backtrace_3d(
+                d_k, w_sub_cpu, seed, best_pin, via_cost=via_cost,
+                w_v=w_v_sub_cpu, extra_sources=extras,
+            )
+            if path is None:
+                nw.failed = True
+                continue
+            nw.paths.append(path)
+            nw.tree.update(path)
+            nw.unrouted.discard(best_pin)
+
     def route(
         self,
         nets: list[Net3D],
@@ -296,10 +419,17 @@ class GuideRouter:
         option b). Each round, every net still missing a pin has its sub-grid
         sliced from the *current* shared `w_cur`, prepped + committed-re-blocked
         per net, padded to the batch's common `(L, H, W)` shape (pad = `inf`),
-        and seeded with its current tree as `extra_sources`; one
-        `sweep_sssp_3d_batched` distances them all; each slice is backtraced
+        and seeded with its current tree as `extra_sources`; a batched
+        `sweep_sssp_3d_batched` distances them; each slice is backtraced
         against its own sub-grid to attach its nearest unrouted pin, growing
         that net's tree. Rounds repeat until no net is still growing.
+
+        When `bucket_size` is set, each round's nets are size-sorted and
+        chunked into `bucket_size`-net buckets, one batched sweep per bucket —
+        so a small net isn't padded up to the round's largest sub-grid. This is
+        a pure throughput optimisation (routes are byte-identical to the single
+        giant batch, `bucket_size=None`) worth ~22–33× on Hazard3
+        (`docs/spikes/size-bucketed-batching.md`, ADR 0013 Amendment 1).
 
         Nets in one round route against the **same `w_cur` snapshot** — they
         don't see each other's commits within the round. Commits land only
@@ -368,102 +498,23 @@ class GuideRouter:
             if not active:
                 break
 
-            # --- Slice + prep + committed-re-block PER NET, then pad+stack. ---
-            # prep_subgrid is per-sub-grid (it cannot run on the stacked tensor),
-            # and the committed re-block must carry into the batched path: prep
-            # rewrites landing-pad cells to finite, resurrecting prior nets'
-            # committed wires unless we re-block after prep (watch-outs 1 & 2).
-            subgrids_h: list[torch.Tensor] = []
-            subgrids_v: list[torch.Tensor] = []
-            for nw in active:
-                reg = nw.region
-                rl = (
-                    slice(reg.l0, reg.l1),
-                    slice(reg.r0, reg.r1),
-                    slice(reg.c0, reg.c1),
-                )
-                # Clone: prep mutates in place and the slice is a view into the
-                # shared w_cur — prepping the view would corrupt the snapshot.
-                w_sub = w_cur[rl].clone()
-                w_v_sub = w_v_cur[rl].clone() if w_v_cur is not None else None
-                if self.prep_subgrid is not None:
-                    assert committed is not None
-                    sub_committed = committed[rl]
-                    self.prep_subgrid(w_sub, nw.local_pins)
-                    w_sub[sub_committed] = inf  # prep must not resurrect wires
-                    if w_v_sub is not None:
-                        self.prep_subgrid(w_v_sub, nw.local_pins)
-                        w_v_sub[sub_committed] = inf
-                subgrids_h.append(w_sub)
-                if w_v_sub is not None:
-                    subgrids_v.append(w_v_sub)
-
-            lmax = max(g.shape[0] for g in subgrids_h)
-            hmax = max(g.shape[1] for g in subgrids_h)
-            wmax = max(g.shape[2] for g in subgrids_h)
-            K = len(active)
-            w_batch = torch.full(
-                (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
-            )
-            for k, g in enumerate(subgrids_h):
-                gl, gh, gw = g.shape
-                w_batch[k, :gl, :gh, :gw] = g
-            w_v_batch: torch.Tensor | None = None
-            if subgrids_v:
-                w_v_batch = torch.full(
-                    (K, lmax, hmax, wmax), inf, device=device, dtype=w_cur.dtype
-                )
-                for k, g in enumerate(subgrids_v):
-                    gl, gh, gw = g.shape
-                    w_v_batch[k, :gl, :gh, :gw] = g
-
-            # Each net's primary source is its seed pin (tree[0] == local_pins[0]);
-            # its extra_sources are the rest of its current tree. A multi-source
-            # sweep gives "distance to nearest tree cell", the attachment quantity.
-            sources = [nw.local_pins[0] for nw in active]
-            extra_sources = [
-                [c for c in nw.tree if c != nw.local_pins[0]] for nw in active
-            ]
-            d_batch, _ = sweep_sssp_3d_batched(
-                w_batch, sources, via_cost=via_cost, w_v=w_v_batch,
-                extra_sources=extra_sources,
-            )
-            d_cpu = d_batch.cpu()
-
-            # --- Per-net backtrace against its OWN sub-grid (CPU-side). ---
-            # NOTE (Slice 3 walk-back watch): this per-net CPU backtrace is the
-            # cost not amortised by the batched sweep. If it dominates the kernel
-            # saving at Hazard3 scale, that's the ADR-0012 signal to push
-            # backtrace onto the GPU or revisit batch grouping.
-            for k, nw in enumerate(active):
-                gl, gh, gw = subgrids_h[k].shape
-                d_k = d_cpu[k, :gl, :gh, :gw]
-                w_sub_cpu = subgrids_h[k].cpu()
-                w_v_sub_cpu = (
-                    subgrids_v[k].cpu() if subgrids_v else None
-                )
-                seed = nw.local_pins[0]
-                extras = extra_sources[k]  # same tree-minus-seed used for the sweep
-                best_pin: tuple[int, int, int] | None = None
-                best_dist = inf
-                for p in nw.unrouted:
-                    dp = float(d_k[p].item())
-                    if dp < best_dist:
-                        best_dist = dp
-                        best_pin = p
-                if best_pin is None or best_dist == inf:
-                    nw.failed = True
-                    continue
-                path = backtrace_3d(
-                    d_k, w_sub_cpu, seed, best_pin, via_cost=via_cost,
-                    w_v=w_v_sub_cpu, extra_sources=extras,
-                )
-                if path is None:
-                    nw.failed = True
-                    continue
-                nw.paths.append(path)
-                nw.tree.update(path)
-                nw.unrouted.discard(best_pin)
+            # Size-bucket within the round so small nets aren't padded up to the
+            # round's largest sub-grid. Mixed sizes in one batch waste ~31× cells
+            # and made one-giant-batch routing 70× slower than bucketed at the
+            # sweep level (docs/spikes/size-bucketed-batching.md). bucket_size=None
+            # keeps the single-batch behaviour. Every bucket shares this round's
+            # w_cur snapshot (no commit between buckets) — same-snapshot semantics
+            # preserved; commit lands after all buckets, below.
+            if self.bucket_size is None:
+                batches: list[list[_NetWork]] = [active]
+            else:
+                ordered = sorted(active, key=lambda nw: nw.region.cell_count)
+                bs = self.bucket_size
+                batches = [
+                    ordered[i:i + bs] for i in range(0, len(ordered), bs)
+                ]
+            for batch in batches:
+                self._attach_batch(batch, w_cur, w_v_cur, committed, via_cost)
 
             # --- Commit fully-routed nets between rounds, HPWL-ascending. ---
             # A net is done when it has no unrouted pins left. Committing its

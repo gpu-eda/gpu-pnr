@@ -81,6 +81,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
                    help="number of routable nets to route on the shared grid")
     p.add_argument("--margin", type=int, default=4, help="guide_region margin (cells)")
     p.add_argument("--seed", type=int, default=0, help="sample shuffle seed")
+    p.add_argument("--bucket", type=int, default=None,
+                   help="size-bucket each round into K-net chunks (low padding). "
+                        "Default None = one giant batch per round.")
     return p.parse_args(argv)
 
 
@@ -126,7 +129,7 @@ def main(argv: list[str] | None = None) -> None:
     router = GuideRouter(
         w_chip, chip_origin=chip_origin, layer_order=LAYER_ORDER,
         pitch_dbu=args.pitch, margin=args.margin, chip_shape=chip_shape,
-        prep_subgrid=prep,
+        prep_subgrid=prep, bucket_size=args.bucket,
     )
 
     # Warm up the device so the first timed route doesn't eat shader compile.
