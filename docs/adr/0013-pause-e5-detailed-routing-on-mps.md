@@ -2,9 +2,10 @@
 
 **Status:** Accepted (2026-06-02); **REVERSED by Amendment 1 (2026-06-03)** —
 the pause rested on the *un-bucketed* router; size-bucketing makes the MPS
-router 22–33× faster and throughput-competitive with drt. Read the original
-decision below as superseded; the critical-learnings retrospective stands
-(with the correction in Amendment 1).
+router 22–33× faster, narrowing the gap to drt from ~100× to ~3.8× (still
+slower, but no longer an MPS ceiling). Read the original decision below as
+superseded; the critical-learnings retrospective stands (with the correction
+in Amendment 1).
 
 ## Context
 
@@ -158,8 +159,12 @@ measures the result:
 
 - **End-to-end: 262–391 → 11.76 ms/net (22–33× faster), routing bit-identical**
   (same 853/935 routed, same 1587 deferred conflicts; pinned by a test). The
-  bucketed MPS router is now **3.4× faster than sequential** and **~2.5× faster
-  than OpenROAD drt per-net**; whole-chip ~4 min vs drt's ~12.
+  bucketed MPS router is **3.4× faster than sequential**. **vs drt: still ~3.8×
+  *slower* at comparable work** — bucketing closed a ~100× gap, it did not make
+  us faster than drt. (An earlier draft claimed "~2.5× faster than drt"; that
+  divided drt's full DRC-clean run by net count vs our single dirty pass —
+  corrected in `docs/results.md` "drt performance — the honest like-for-like":
+  drt's *initial route* is 3.07 ms/net vs our 11.76, multi-threaded CPU.)
 - Sweep-level: bucketing cuts padding waste 31× → 1.0× and the sweep 70×
   (310.88 → 4.42 ms/net), beating sequential 4.9×.
 
@@ -186,9 +191,11 @@ was premature by one optimization.
 
 ### What changes
 
-- **WS3.3 resumes on MPS.** The throughput basis for pausing is gone. Slices 4
-  (rip-up), 5 (tail), 6 (chip-scale gate) proceed as correctness work, now on a
-  router that is throughput-competitive with drt.
+- **WS3.3 resumes on MPS.** The throughput basis for pausing is gone — the
+  collapse was a fixable padding bug, not an MPS ceiling. Slices 4 (rip-up), 5
+  (tail), 6 (chip-scale gate) proceed as correctness work. (Note: the bucketed
+  router is ~3.8× *slower* than drt's comparable initial pass — see
+  `docs/results.md` — so "resume," not "we win on speed.")
 - **Size-bucketing is a WS3.3 deliverable**, not a deferred lever (it is the
   difference between 4 min and 134 min). The `bucket_size=None` giant-batch path
   stays only as A/B scaffolding until a default is chosen.

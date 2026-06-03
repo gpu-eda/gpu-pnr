@@ -211,9 +211,9 @@ twice. WS3.3 is the right next step.
 *un-bucketed* round-batched router measured 1–11× slower than drt — but that
 collapse was padding-to-max waste, and **size-bucketing fixes it: 22–33× faster
 end-to-end, routes bit-identical** ([`size-bucketed-batching`](../spikes/size-bucketed-batching.md),
-ADR 0013 Am1). The bucketed MPS router is now ~2.5× faster than drt per-net.
-Slices 1–3 + size-bucketing landed; **Slice 4 (rip-up) is next**. The remaining
-WS3.3 gates are correctness (Slices 4–6), not throughput.
+ADR 0013 Am1). The bucketed MPS router is still ~3.8× *slower* than drt's
+comparable initial pass (bucketing closed a ~100× gap; not ahead — see
+`results.md`). Slices 1–3 + size-bucketing landed; **Slice 4 (rip-up) is next**.
 
 [ADR 0012](../adr/0012-tile-decomposition.md) Accepted
 2026-05-14, then **pivoted by Amendments 1–4** (2026-05-28/29): the
@@ -271,9 +271,10 @@ terminal Hazard3 + 4096² gate.
 - [ ] A 4096² grid routed by guide-constrained sweep, no quality regression —
       correctness gate met at small scale (Slice 3); full gate is Slice 6.
 - [~] Whole-chip Hazard3 competitive with TritonRoute (≤1.2× wire/vias). On the
-      in-cap set: **quality** wire ~1.00× / vias ~0.45×, **throughput** ~2.5×
-      faster than drt per-net after size-bucketing (ADR 0013 Am1). Remaining for
-      the *complete* claim: rip-up (Slice 4) → 100% + DRC, and the tail (Slice 5).
+      in-cap set: **quality** wire ~1.00× / vias ~0.45× (meets it). **Throughput:**
+      ~3.8× *slower* than drt's comparable initial pass after size-bucketing
+      (was ~100×; `results.md` like-for-like). Remaining for the *complete* claim:
+      rip-up (Slice 4) → 100% + DRC, tail (Slice 5), and the throughput gap.
 
 ## Phase 3 exit criteria
 

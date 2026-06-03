@@ -5,7 +5,8 @@ brief 2026-06-02 pause ([ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.
 was reversed (Am1): Slice 3's collapse was padding-to-max waste, and
 size-bucketing makes the router **22–33× faster, routes bit-identical**
 ([`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md)) —
-now ~2.5× faster than drt per-net. **Slice 4 (rip-up) is next.**
+closing a ~100× gap to ~3.8× slower than drt's comparable pass (not ahead).
+**Slice 4 (rip-up) is next.**
 
 Supersedes the 8-slice fixed-tile + K=100 + halo plan (in `git log` before
 2026-06-01), which [ADR 0012](../adr/0012-tile-decomposition.md) Amendments
@@ -162,8 +163,9 @@ sequential). The initial round-batched router collapsed at scale (sample-1000
 size-sorted and chunked so a small net isn't padded to the round's largest.
 **Result: 22–33× faster end-to-end (11.76 ms/net), routes bit-identical**
 ([`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md),
-ADR 0013 Am1) — now ~2.5× faster than drt per-net. Quality (small sample) vs
-drt: wirelength 1.003×, vias 0.453×. Full data: `docs/results.md` Phase 3.3.
+ADR 0013 Am1) — closes a ~100× gap to **~3.8× slower than drt's comparable
+initial pass** (3.07 ms/net; not ahead — `results.md` like-for-like). Quality
+(small sample) vs drt: wirelength 1.003×, vias 0.453×.
 
 **Carried follow-ups:** (1) **the per-net CPU backtrace is now the top
 throughput cost** (~60% of the bucketed router) — within uniform-shaped buckets

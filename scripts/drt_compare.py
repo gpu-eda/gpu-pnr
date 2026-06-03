@@ -48,21 +48,47 @@ DBU_PER_UM = 2000  # DEF: UNITS DISTANCE MICRONS 2000
 PITCH = TRACK_PITCH_DBU  # 1120 DBU per track-grid step
 
 
-def drt_reference() -> dict[str, float]:
-    """OpenROAD drt totals for the fixture's run, from the detailed-routing
-    step beside FINAL_DEF (`44-openroad-detailedrouting/`): net count,
-    wirelength (µm), via count, and wall-clock seconds. This is the Slice 6
-    gate's reference — parsed, not re-run."""
+def _hms_to_s(hms: str) -> float:
+    """`HH:MM:SS[.mmm]` → seconds."""
+    h, m, s = hms.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
+def _drt_initial_route_s(drt_dir) -> float | None:
+    """Elapsed seconds of drt's 0th optimization iteration (the initial detailed
+    route, still DRC-dirty) — the like-for-like stage to compare our single
+    pass against, NOT the full DRC-clean run. Parsed from the routing log:
+    the `DRT-0267` timing line following `Start 0th optimization iteration`.
+    Returns None if the log shape isn't recognised."""
+    log = drt_dir / "openroad-detailedrouting.log"
+    if not log.exists():
+        return None
+    seen_0th = False
+    for line in log.read_text().splitlines():
+        if "Start 0th optimization iteration" in line:
+            seen_0th = True
+        elif seen_0th and "DRT-0267" in line and "elapsed time =" in line:
+            # "... elapsed time = 00:01:14, memory = ..."
+            after = line.split("elapsed time =", 1)[1].strip()
+            return _hms_to_s(after.split(",", 1)[0].strip())
+    return None
+
+
+def drt_reference() -> dict[str, float | None]:
+    """OpenROAD drt reference for the fixture's run, from the detailed-routing
+    step beside FINAL_DEF (`44-openroad-detailedrouting/`). `runtime_s` is the
+    *full* DRC-clean run (rip-up + DRC convergence); `initial_route_s` is just
+    the 0th iteration (initial dirty route) — the honest like-for-like stage
+    against our single pass. Parsed, not re-run."""
     run_dir = FINAL_DEF.parents[2]  # .../RUN_*/final/def/x.def → .../RUN_*
     drt_dir = run_dir / "44-openroad-detailedrouting"
     metrics = json.loads((drt_dir / "or_metrics_out.json").read_text())
-    hms = (drt_dir / "runtime.txt").read_text().strip()  # "HH:MM:SS.mmm"
-    h, m, s = hms.split(":")
     return {
         "nets": metrics["route__net"],
         "wire_um": metrics["route__wirelength"],
         "vias": metrics["route__vias"],
-        "runtime_s": int(h) * 3600 + int(m) * 60 + float(s),
+        "runtime_s": _hms_to_s((drt_dir / "runtime.txt").read_text().strip()),
+        "initial_route_s": _drt_initial_route_s(drt_dir),
     }
 
 
@@ -182,25 +208,27 @@ def main(argv: list[str] | None = None) -> None:
           f"mean={sum(via_ratios)/max(len(via_ratios),1):.3f}×")
     print(f"    totals: ours={our_via_tot} drt={drt_via_tot}")
 
-    # Execution time — our per-net (over the sampled in-cap nets) vs drt's
-    # per-net (over the whole chip, complete + DRC-clean). drt's runtime is
-    # on the fixture's build machine, ours on this one — wall-clock is NOT
-    # hardware-matched, so read per-net throughput as the headline, not the
-    # whole-chip totals.
+    # Execution time. The honest like-for-like is OUR single dirty pass vs drt's
+    # INITIAL route (0th iter, also dirty) — NOT drt's full DRC-clean run, which
+    # includes rip-up + DRC convergence we don't do. drt is multi-threaded; both
+    # are wall-clock and NOT hardware-matched, so read per-net as orientation.
     ref = drt_reference()
+    nets_n = int(ref["nets"] or 0)
+    runtime_s = float(ref["runtime_s"] or 0.0)
+    init_s = ref["initial_route_s"]
     our_ms_net = elapsed * 1000.0 / max(len(nets), 1)
-    drt_ms_net = ref["runtime_s"] * 1000.0 / max(ref["nets"], 1)
-    our_chip_s = our_ms_net * ref["nets"] / 1000.0  # extrapolated to drt's net set
-    print("\n  EXECUTION TIME (per-net throughput is the fair axis):")
-    print(f"    ours:  {our_ms_net:.1f} ms/net  ({len(nets)} in-cap nets, "
-          f"{device}, no rip-up/tail/DRC)")
-    print(f"    drt:   {drt_ms_net:.1f} ms/net  ({ref['nets']:.0f} nets, "
-          f"complete + DRC-clean, {ref['runtime_s']/60:.1f} min total)")
-    print(f"    per-net ratio (ours/drt): {our_ms_net/max(drt_ms_net,1e-9):.2f}× "
-          f"(>1 = we are slower per net)")
-    print(f"    whole-chip extrapolation: ours ~{our_chip_s/60:.1f} min vs "
-          f"drt {ref['runtime_s']/60:.1f} min — but ours omits rip-up/tail/DRC "
-          f"and is not hardware-matched.")
+    print("\n  EXECUTION TIME (like-for-like = our pass vs drt's initial route):")
+    print(f"    ours:           {our_ms_net:.1f} ms/net  ({len(nets)} in-cap "
+          f"nets, {device}, single dirty pass)")
+    if init_s is not None:
+        drt_init_ms = init_s * 1000.0 / max(nets_n, 1)
+        print(f"    drt initial:    {drt_init_ms:.1f} ms/net  ({nets_n} nets, "
+              f"{init_s:.0f}s 0th iter, multi-thread, dirty)")
+        print(f"    → ours/drt-initial: {our_ms_net/max(drt_init_ms,1e-9):.1f}× "
+              f"(>1 = we are slower at comparable work)")
+    drt_full_ms = runtime_s * 1000.0 / max(nets_n, 1)
+    print(f"    drt full run:   {drt_full_ms:.1f} ms/net  ({runtime_s/60:.1f} min, "
+          f"rip-up + DRC-clean — NOT comparable to our dirty pass)")
     print("\n  Gate (Slice 6, full-chip): ≤1.2× wire, ≤1.2× vias. "
           "This is in-cap-only, coarse-grid, no rip-up — orientation only.")
 

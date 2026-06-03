@@ -1109,14 +1109,56 @@ removes it. Hazard3, sample 1000, seed 0, M4 Pro MPS:
   thrash; bucketed is stable.
 - Sweep-level (`batched_sweep_prototype`): bucketing cuts padding waste **31× →
   1.0×** and the sweep **70×** (310.88 → 4.42 ms/net), beating sequential 4.9×.
-- The bucketed MPS router is now **3.4× faster than sequential** (~40 ms/net) and
-  **~2.5× faster than OpenROAD drt per-net** (~30 ms/net); whole-chip ~4 min vs
-  drt ~12 (in-cap only, no rip-up/tail/DRC — throughput, not the complete claim).
+- The bucketed MPS router is now **3.4× faster than sequential** (~40 ms/net). vs
+  drt: see the like-for-like comparison below — bucketing closed a ~100× gap to
+  **~3.8× *slower* than drt's comparable pass**, not faster.
 
-**This reversed ADR 0013's pause (Amendment 1).** WS3.3 resumed on MPS,
-throughput-competitive with drt. The *next* bottleneck is the per-net CPU
-backtrace (~60% of the bucketed router) — vectorisable per uniform bucket, then
-on-GPU. Full spike: [`size-bucketed-batching.md`](spikes/size-bucketed-batching.md).
+**This reversed ADR 0013's pause (Amendment 1)** — the giant-batch collapse that
+justified pausing was padding, not an MPS ceiling. WS3.3 resumed on MPS. The
+*next* throughput bottleneck is the per-net CPU backtrace (~60% of the bucketed
+router) — vectorisable per uniform bucket, then on-GPU. Full spike:
+[`size-bucketed-batching.md`](spikes/size-bucketed-batching.md).
+
+## drt performance — the honest like-for-like (corrects an earlier overclaim)
+
+An earlier draft of this section claimed the bucketed router is "~2.5× faster
+than drt per-net." **That was wrong** — it divided drt's *full* detailed-routing
+runtime (which includes rip-up + DRC convergence) by net count and compared it
+to our *single dirty pass*, i.e. it credited us for skipping DRC. Decomposing
+drt's run (run 05-08 detailed-routing log, multi-threaded ~5–10 cores) gives the
+real picture:
+
+| drt phase | elapsed | result |
+|---|---:|---|
+| pin access | 13s | |
+| track assignment | 4s | |
+| **0th iter — initial route** | **74s** | 11,788 DRC violations (first dirty pass) |
+| 1st–2nd iter (rip-up) | 76s + 75s | → 4,500 |
+| 3rd iter (DRC convergence) | 445s | → 109 |
+| 4th iter | 1s | → 0, DRC-clean |
+| **total detailed routing** | **~673s** | |
+
+The like-for-like stage is **drt's 0th iteration** (initial route, still dirty)
+vs **our single pass** (also dirty):
+
+| | ms/net | hardware | nets | state |
+|---|---:|---|---:|---|
+| drt initial route (0th iter) | **3.07** (74s) | ~5–10 CPU cores | 24,124 (all) | 11,788 viols |
+| us, size-bucketed | **11.76** | 1 GPU stream | ~20.5k in-cap | 1,587 conflicts |
+
+- **drt is ~3.8× faster than us at comparable work** — and it routes *more* nets
+  (incl. the over-cap tail we skip), on CPU, likely on slower hardware than this
+  M4 Pro. **We do not beat drt on routing throughput.**
+- Per-compute-unit it's closer: drt's 0th iter is cpu 6:41 / elapsed 1:14 ≈ 5.4
+  threads → ~16.6 cpu-ms/net single-thread-equivalent vs our 11.76 gpu-ms/net.
+  drt wins on *wall-clock* (it uses its cores); we're competitive per unit.
+- **Size-bucketing was still essential**: it took us from ~100× slower than
+  drt's initial pass (giant-batch 262–391 ms/net) to ~3.8× slower. That's
+  "hopeless → same ballpark," not "ahead."
+- **Root cause of the remaining gap** (the `gpu-vs-drt-throughput` spike named
+  it): drt runs *guided A\* + pattern routing* over ~1–5k cells/net; we run a
+  *full SSSP sweep* over the sub-grid. Closing it needs bounded/guided search +
+  on-GPU backtrace + CUDA — not more bucketing.
 
 ## Reproduce (Slice 3)
 

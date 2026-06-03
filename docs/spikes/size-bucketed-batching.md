@@ -56,8 +56,9 @@ giant batch is the entire cost.
 ~1 GB tensor thrash, 262–391; bucketed is stable at 11.76). Crucially the
 routing is **bit-identical** — same 853/935 routed, same 1587 deferred
 conflicts — pinned by `test_bucketed_route_identical_to_single_batch`. The
-bucketed router is now **3.4× faster than sequential** (~40 ms/net) and **~2.5×
-faster than OpenROAD drt per-net** (~30 ms/net); whole-chip ~4 min vs drt ~12.
+bucketed router is now **3.4× faster than sequential** (~40 ms/net). vs drt it
+is still **~3.8× slower at comparable work** — bucketing closed a ~100× gap, it
+did not pull ahead (see "vs OpenROAD drt — the like-for-like" below).
 
 ### What this corrects
 
@@ -75,13 +76,34 @@ padding has a cheap, pure-MPS fix (no kernel change, no CUDA).
    to be set when WS3.3 resumes; K=16 measured here). It is **not** an optional
    lever — for the end-to-end router it is the difference between 4 min and 134
    min on MPS.
-2. **ADR 0013's throughput pause is reversed** (ADR 0013 Amendment 1). E5-on-MPS
-   is throughput-competitive with drt on the in-cap set; the basis for "MPS
-   can't win" is gone.
+2. **ADR 0013's throughput pause is reversed** (ADR 0013 Amendment 1). The
+   collapse was a fixable padding bug, not an MPS ceiling — the basis for "MPS
+   can't win" is gone. (E5-on-MPS is **not** faster than drt; see below.)
 3. **The next bottleneck is the per-net CPU backtrace** (~7 s / ~60% of the
    bucketed router's time). With buckets uniform-shaped, the best-pin argmin
    vectorises to one gather + `torch.min` per bucket; on-GPU backtrace is the
    lever beyond that. This is now the top WS3.3 throughput follow-up.
+
+## vs OpenROAD drt — the like-for-like (we are still slower)
+
+Comparing our single dirty pass to drt's *full* DRC-clean run (~673s) flatters
+us; the honest comparison is against drt's **initial route** (0th iteration,
+also dirty). From the run-05-08 detailed-routing log (drt is multi-threaded,
+~5–10 cores):
+
+| | ms/net | hardware | nets | state |
+|---|---:|---|---:|---|
+| drt initial route (0th iter, 74s) | **3.07** | ~5–10 CPU cores | 24,124 (all) | 11,788 viols |
+| us, size-bucketed | **11.76** | 1 GPU stream | ~20.5k in-cap | 1,587 conflicts |
+
+**drt is ~3.8× faster at comparable work**, routing more nets, on CPU, likely on
+slower hardware. Bucketing closed a ~100× gap (giant-batch 262–391 ms/net) to
+~3.8×, i.e. "hopeless → same ballpark," not "ahead." Per-compute-unit it's
+closer (drt ~16.6 cpu-ms/net single-thread-equiv vs our 11.76 gpu-ms/net); drt
+wins wall-clock by using its cores. Closing the remaining gap is a *search-space*
+problem (drt: guided A\* + pattern routing over ~1–5k cells/net; us: full SSSP
+sweep), not a bucketing one. Full decomposition: `docs/results.md` "drt
+performance — the honest like-for-like."
 
 ## What this does NOT cover
 
