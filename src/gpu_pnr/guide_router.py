@@ -33,7 +33,7 @@ Conventions:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 
 import torch
@@ -203,7 +203,21 @@ def classify_nets(
     return in_cap, tail
 
 
-@dataclass
+def _cell_index_tensors(
+    cells: Sequence[tuple[int, int, int]], device: torch.device
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Split a list of `(l, r, c)` cells into per-axis long tensors for one
+    batched `w[ls, rs, cs] = ...` index-assignment. Per-cell scalar writes are
+    a kernel launch + sync each on MPS — death by O(cells) launches — so both
+    the commit and the rip-up restore route through this single batched form.
+    """
+    return tuple(  # type: ignore[return-value]
+        torch.tensor(axis, device=device, dtype=torch.long)
+        for axis in zip(*cells)
+    )
+
+
+@dataclass(eq=False)
 class _NetWork:
     """Mutable per-net routing state advanced one attachment per round.
 
@@ -212,6 +226,12 @@ class _NetWork:
     outer axis is the attachment round and the inner axis is the net: `tree`,
     `unrouted`, and `paths` are in sub-grid-local coords; a net is still growing
     while `unrouted` is non-empty and `failed` is False.
+
+    Slice 4 adds `committed_cells` (chip-global), the footprint this net last
+    committed — the cell set rip-up restores from `w_chip` when the net loses a
+    conflict — `global_paths`, the committed paths in chip-global coords (built
+    once at commit, reused for the result), and `ripups`, the count of times it
+    has been ripped up (capped).
     """
 
     plan: NetPlan
@@ -221,6 +241,9 @@ class _NetWork:
     unrouted: set[tuple[int, int, int]]
     paths: list[list[tuple[int, int, int]]]
     failed: bool
+    committed_cells: set[tuple[int, int, int]]
+    global_paths: list[list[tuple[int, int, int]]]
+    ripups: int
 
 
 class GuideRouter:
@@ -405,91 +428,49 @@ class GuideRouter:
             nw.tree.update(path)
             nw.unrouted.discard(best_pin)
 
-    def route(
-        self,
-        nets: list[Net3D],
-        guides: Sequence[Sequence[GuideRect]],
-        *,
-        via_cost: float = 1.0,
-    ) -> list[MultiPin3DResult]:
-        """Route in-cap nets via round-batched guide-constrained sweeps (Slice 3).
+    # Max rip-up rounds before a still-conflicting net is left failed (Slice 4,
+    # plan §"Slice 4"). Walk-back: raise to 5 if >1% of nets fail to converge.
+    MAX_RIPUPS = 3
 
-        In-cap nets route together on the shared chip cost grid, batched by
-        *attachment round* (`docs/spikes/multi-pin-batching-strategy.md`,
-        option b). Each round, every net still missing a pin has its sub-grid
-        sliced from the *current* shared `w_cur`, prepped + committed-re-blocked
-        per net, padded to the batch's common `(L, H, W)` shape (pad = `inf`),
-        and seeded with its current tree as `extra_sources`; a batched
-        `sweep_sssp_3d_batched` distances them; each slice is backtraced
-        against its own sub-grid to attach its nearest unrouted pin, growing
-        that net's tree. Rounds repeat until no net is still growing.
+    def _seed_work(self, plan: NetPlan) -> _NetWork | None:
+        """Build a fresh unrouted `_NetWork` for `plan`, or None if off-region.
 
-        When `bucket_size` is set, each round's nets are size-sorted and
-        chunked into `bucket_size`-net buckets, one batched sweep per bucket —
-        so a small net isn't padded up to the round's largest sub-grid. This is
-        a pure throughput optimisation (routes are byte-identical to the single
-        giant batch, `bucket_size=None`) worth ~22–33× on Hazard3
-        (`docs/spikes/size-bucketed-batching.md`, ADR 0013 Amendment 1).
-
-        Nets in one round route against the **same `w_cur` snapshot** — they
-        don't see each other's commits within the round. Commits land only
-        between rounds; cross-net conflicts from same-round routing are Slice
-        4's job, not handled here. Routing order across nets is HPWL-ascending
-        (ADR 0007) within each round's commit step. Tail nets (over-cap /
-        no-guide) and nets whose region doesn't contain all their pins are
-        returned unrouted; the coarsened-pass fallback for the tail lands in
-        Slice 5.
-
-        Results are returned in input order. Paths and pins are in chip-global
-        `(layer, row, col)` coordinates. API mirrors `route_multipin_nets_3d`
-        plus the per-net `guides` (parallel to `nets`).
+        Used both for the initial population and to reset a net on rip-up (tree
+        back to the seed pin, paths cleared, committed footprint emptied).
         """
-        if self.w_chip is None:
-            raise ValueError("route requires a w_chip cost tensor")
-
-        # tail nets (over-cap / no-guide) keep the unrouted sentinel below.
-        in_cap, _ = self.classify(nets, guides)
-        inf = float("inf")
-        w_cur = self.w_chip.clone()
-        w_v_cur = self.w_v_chip.clone() if self.w_v_chip is not None else None
-        device = w_cur.device
-        # Tracks cells committed by earlier nets. Needed only with prep_subgrid:
-        # a PDK prep (e.g. pin-access) rewrites landing-pad cells to finite,
-        # which would *resurrect* a prior net's committed wire and let two nets
-        # share a cell. We re-block committed cells after prep to prevent that.
-        # NOTE for Slice 4 (rip-up): un-committing a net's cells must also clear
-        # its bits here, or a rerouted net could be wrongly re-blocked.
-        committed = (
-            torch.zeros_like(w_cur, dtype=torch.bool)
-            if self.prep_subgrid is not None else None
+        reg = plan.region
+        if not all(reg.contains(p) for p in plan.pins):
+            return None  # off-region: caller leaves the unrouted sentinel
+        local = [reg.rebase(p) for p in plan.pins]
+        return _NetWork(
+            plan=plan,
+            region=reg,
+            local_pins=local,
+            tree={local[0]},
+            unrouted=set(local[1:]),
+            paths=[[local[0]]],
+            failed=False,
+            committed_cells=set(),
+            global_paths=[],
+            ripups=0,
         )
 
-        # Pre-fill every slot unrouted (preserving input order); tail, off-region,
-        # and route-fail nets keep this sentinel — only successful routes overwrite.
-        results = [MultiPin3DResult(list(pins), None) for pins in nets]
-
-        # Build the per-net work-items for the still-growing population. Each
-        # carries its region + a CPU-side mutable tree/unrouted/paths state that
-        # round-batching advances one attachment per round (transpose of the
-        # sequential tree-growth loop in route_multipin_nets_3d).
-        work: list[_NetWork] = []
-        for plan in in_cap:  # HPWL-ascending
-            reg = plan.region
-            if not all(reg.contains(p) for p in plan.pins):
-                continue  # off-region: leave the unrouted sentinel
-            local = [reg.rebase(p) for p in plan.pins]
-            work.append(
-                _NetWork(
-                    plan=plan,
-                    region=reg,
-                    local_pins=local,
-                    tree={local[0]},
-                    unrouted=set(local[1:]),
-                    paths=[[local[0]]],
-                    failed=False,
-                )
-            )
-
+    def _route_population(
+        self,
+        work: Iterable[_NetWork],
+        w_cur: torch.Tensor,
+        w_v_cur: torch.Tensor | None,
+        committed: torch.Tensor | None,
+        via_cost: float,
+    ) -> None:
+        """Drain `work` to completion: round-batched attachment + per-round
+        commit. Each fully-routed net's footprint is committed to `w_cur` (inf
+        obstacle for later rounds) and recorded in `nw.committed_cells` (Slice 4
+        rip-up restores from that set). Mutates `work` items + the grids in
+        place; off-/failed nets stay unrouted.
+        """
+        inf = float("inf")
+        device = w_cur.device
         # Round-batched attachment loop. A net is "still growing" while it has
         # unrouted pins and hasn't failed. The same w_cur snapshot bounds every
         # net in a round; commits land in the per-round commit step below.
@@ -520,8 +501,8 @@ class GuideRouter:
             # A net is done when it has no unrouted pins left. Committing its
             # cells to inf makes them obstacles for the *next* round's snapshot
             # (so later-round nets detour); within-round nets shared this round's
-            # snapshot and may collide — Slice 4 resolves that. `active` is
-            # already HPWL-ascending (in_cap order is preserved through `work`).
+            # snapshot and may collide — the rip-up loop in `route` resolves that.
+            # `active` is already HPWL-ascending (in_cap order is preserved).
             for nw in active:
                 if nw.failed or nw.unrouted:
                     continue
@@ -531,19 +512,201 @@ class GuideRouter:
                     for path in nw.paths
                 ]
                 cells = [c for path in global_paths for c in path]
-                # One batched index-assignment, not per-cell (each scalar write
-                # is a kernel launch + sync on MPS — death by O(cells) launches).
-                ls, rs, cs = (
-                    torch.tensor(axis, device=device, dtype=torch.long)
-                    for axis in zip(*cells)
-                )
+                ls, rs, cs = _cell_index_tensors(cells, device)
                 w_cur[ls, rs, cs] = inf
                 if w_v_cur is not None:
                     w_v_cur[ls, rs, cs] = inf
                 if committed is not None:
                     committed[ls, rs, cs] = True
-                results[nw.plan.index] = MultiPin3DResult(
-                    list(nw.plan.pins), global_paths
-                )
+                nw.committed_cells = set(cells)
+                nw.global_paths = global_paths  # reused at result assembly
 
+    def _ripup_net(
+        self,
+        nw: _NetWork,
+        keep: set[tuple[int, int, int]],
+        w_cur: torch.Tensor,
+        w_v_cur: torch.Tensor | None,
+        committed: torch.Tensor | None,
+    ) -> None:
+        """Un-commit `nw`: restore its loser-exclusive cells from the original
+        chip grid and clear their committed bits, so a reroute sees true chip
+        cost (PDK pin-access included), not a stale inf or a clear-to-finite
+        shortcut that would resurrect the conflict (handoff watch-out).
+
+        `keep` is the set of cells still claimed by a surviving net (the
+        conflict winner): those stay committed to the winner and are NOT
+        restored. Only this net's exclusive cells revert.
+        """
+        assert self.w_chip is not None
+        device = w_cur.device
+        restore = [c for c in nw.committed_cells if c not in keep]
+        if restore:
+            # Full restore from the original chip grid (NOT a clear-to-finite):
+            # keeps PDK pin-access values prep_subgrid relies on.
+            ls, rs, cs = _cell_index_tensors(restore, device)
+            w_cur[ls, rs, cs] = self.w_chip[ls, rs, cs]
+            if w_v_cur is not None and self.w_v_chip is not None:
+                w_v_cur[ls, rs, cs] = self.w_v_chip[ls, rs, cs]
+            if committed is not None:
+                committed[ls, rs, cs] = False
+        nw.committed_cells = set()
+        nw.global_paths = []
+
+    def route(
+        self,
+        nets: list[Net3D],
+        guides: Sequence[Sequence[GuideRect]],
+        *,
+        via_cost: float = 1.0,
+    ) -> list[MultiPin3DResult]:
+        """Route in-cap nets via round-batched guide-constrained sweeps with
+        cross-net conflict rip-up / reroute (Slices 3–4).
+
+        In-cap nets route together on the shared chip cost grid, batched by
+        *attachment round* (`docs/spikes/multi-pin-batching-strategy.md`,
+        option b). Each round, every net still missing a pin has its sub-grid
+        sliced from the *current* shared `w_cur`, prepped + committed-re-blocked
+        per net, padded to the batch's common `(L, H, W)` shape (pad = `inf`),
+        and seeded with its current tree as `extra_sources`; a batched
+        `sweep_sssp_3d_batched` distances them; each slice is backtraced
+        against its own sub-grid to attach its nearest unrouted pin, growing
+        that net's tree. Rounds repeat until no net is still growing.
+
+        When `bucket_size` is set, each round's nets are size-sorted and
+        chunked into `bucket_size`-net buckets, one batched sweep per bucket —
+        so a small net isn't padded up to the round's largest sub-grid. This is
+        a pure throughput optimisation (routes are byte-identical to the single
+        giant batch, `bucket_size=None`) worth ~22–33× on Hazard3
+        (`docs/spikes/size-bucketed-batching.md`, ADR 0013 Amendment 1).
+
+        Nets in one round route against the **same `w_cur` snapshot**, so two
+        can claim the same cell. After the population drains, **Slice 4**
+        detects cells claimed by ≥2 committed nets; the lowest-HPWL net keeps
+        each contested cell (ADR 0007) and the losers are ripped up — their
+        loser-exclusive cells restored from the original chip grid — and
+        rerouted against the updated `w_cur` in a further pass. Bounded to
+        `MAX_RIPUPS` (3) passes; a net still conflicting after the cap is left
+        failed (unrouted sentinel). This is the [ADR 0008] deferred-net unlock
+        on guide sub-grids. Tail nets (over-cap / no-guide) and nets whose
+        region doesn't contain all their pins are returned unrouted; the
+        coarsened-pass fallback for the tail lands in Slice 5.
+
+        Results are returned in input order. Paths and pins are in chip-global
+        `(layer, row, col)` coordinates. API mirrors `route_multipin_nets_3d`
+        plus the per-net `guides` (parallel to `nets`).
+        """
+        if self.w_chip is None:
+            raise ValueError("route requires a w_chip cost tensor")
+
+        # tail nets (over-cap / no-guide) keep the unrouted sentinel below.
+        in_cap, _ = self.classify(nets, guides)
+        w_cur = self.w_chip.clone()
+        w_v_cur = self.w_v_chip.clone() if self.w_v_chip is not None else None
+        # Tracks cells committed by earlier nets. Needed only with prep_subgrid:
+        # a PDK prep (e.g. pin-access) rewrites landing-pad cells to finite,
+        # which would *resurrect* a prior net's committed wire and let two nets
+        # share a cell. We re-block committed cells after prep to prevent that.
+        # Rip-up (`_ripup_net`) clears the bits it restores, or a rerouted net
+        # could be wrongly re-blocked.
+        committed = (
+            torch.zeros_like(w_cur, dtype=torch.bool)
+            if self.prep_subgrid is not None else None
+        )
+
+        # Build the per-net work-items for the still-growing population, keyed
+        # by input index. Each carries its region + a CPU-side mutable
+        # tree/unrouted/paths state that round-batching advances one attachment
+        # per round (transpose of the sequential tree-growth loop in
+        # route_multipin_nets_3d). Dict insertion order is in_cap order
+        # (HPWL-ascending), preserved through the conflict winner-selection
+        # below; reassigning a key on rip-up keeps its position.
+        net_to_work: dict[int, _NetWork] = {}
+        for plan in in_cap:  # HPWL-ascending
+            nw = self._seed_work(plan)
+            if nw is None:
+                continue  # off-region: leave the unrouted sentinel
+            net_to_work[plan.index] = nw
+
+        # Rip-up / reroute loop. Route the population, detect cross-net
+        # conflicts in the committed footprints, keep the lowest-HPWL claimant
+        # of each contested cell, rip up + requeue the losers, and reroute.
+        # Bounded to MAX_RIPUPS passes (else the loser is left failed).
+        self._route_population(net_to_work.values(), w_cur, w_v_cur, committed, via_cost)
+        for _ in range(self.MAX_RIPUPS):
+            # A budget-exhausted loser can't reroute again; drop it from the
+            # requeue set so it's left to fail rather than re-detected forever.
+            losers = {
+                nw for nw in self._collect_losers(net_to_work.values())
+                if nw.ripups < self.MAX_RIPUPS
+            }
+            if not losers:
+                break
+            # Winners keep their cells; restore only loser-exclusive cells.
+            keep: set[tuple[int, int, int]] = set()
+            for nw in net_to_work.values():
+                if nw not in losers and not nw.failed:
+                    keep |= nw.committed_cells
+            for plan_index, nw in list(net_to_work.items()):
+                if nw not in losers:
+                    continue
+                self._ripup_net(nw, keep, w_cur, w_v_cur, committed)
+                # Reset to a fresh unrouted state (tree back to seed, paths
+                # cleared) and requeue in place. off-region is impossible here
+                # (it routed once) but guard anyway.
+                fresh = self._seed_work(nw.plan)
+                if fresh is None:
+                    del net_to_work[plan_index]
+                    continue
+                fresh.ripups = nw.ripups + 1
+                net_to_work[plan_index] = fresh  # reassign keeps dict position
+            self._route_population(net_to_work.values(), w_cur, w_v_cur, committed, via_cost)
+
+        # Any net that still conflicts after the rip-up budget is left failed
+        # (unrouted sentinel). Detect a final time including budget-exhausted
+        # losers so they're caught and dropped here.
+        final_losers = self._collect_losers(net_to_work.values())
+
+        # Assemble results in input order: a routed net is one that committed a
+        # footprint and is not a residual conflict loser; everything else keeps
+        # the unrouted sentinel (tail, off-region, route-fail, over-cap loser).
+        # `global_paths` was built once at commit (`_route_population`).
+        results = [MultiPin3DResult(list(pins), None) for pins in nets]
+        for plan_index, nw in net_to_work.items():
+            if nw.failed or nw.unrouted or not nw.committed_cells:
+                continue
+            if nw in final_losers:
+                continue  # still conflicting after the cap → leave failed
+            results[plan_index] = MultiPin3DResult(
+                list(nw.plan.pins), nw.global_paths
+            )
         return results
+
+    def _collect_losers(self, work: Iterable[_NetWork]) -> set[_NetWork]:
+        """Return every conflict-loser `_NetWork` in `work`.
+
+        A cell claimed by ≥2 committed nets is a conflict; the lowest-HPWL
+        claimant (ADR 0007) keeps it, the rest are losers. A net is a loser if
+        it loses ANY of its committed cells. Callers filter budget-exhausted
+        losers themselves (the requeue pass drops them so they aren't
+        re-detected forever; the final-assembly pass keeps them so they fall to
+        the unrouted sentinel).
+        """
+        # cell -> list of (hpwl, NetWork) committed claimants.
+        claims: dict[tuple[int, int, int], list[tuple[int, _NetWork]]] = {}
+        for nw in work:
+            if nw.failed or nw.unrouted or not nw.committed_cells:
+                continue
+            h = net_hpwl(nw.plan.pins)
+            for cell in nw.committed_cells:
+                claims.setdefault(cell, []).append((h, nw))
+        losers: set[_NetWork] = set()
+        for cell, claimants in claims.items():
+            if len(claimants) < 2:
+                continue
+            # Lowest HPWL wins; ties broken by input index (stable, ADR 0007).
+            winner = min(claimants, key=lambda hc: (hc[0], hc[1].plan.index))[1]
+            for _, nw in claimants:
+                if nw is not winner:
+                    losers.add(nw)
+        return losers

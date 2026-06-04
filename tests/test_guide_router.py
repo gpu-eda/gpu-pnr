@@ -200,45 +200,45 @@ def test_route_single_net_matches_direct():
     assert res.cells == ref_global
 
 
-def test_same_round_nets_share_snapshot_no_intra_round_detour():
-    """Slice 3 semantics change vs Slice 2: nets routed in the same batch route
-    against the SAME w_cur snapshot — they do NOT see each other's commits, so
-    an overlapping net does NOT detour around a same-round net (Slice 2's
-    sequential within-batch detour is gone). Both route; resulting cross-net
-    overlap is a conflict that Slice 4's rip-up resolves — not handled here."""
+def test_same_round_nets_share_snapshot_resolved_by_ripup():
+    """Slice 3 routes same-round nets against the SAME w_cur snapshot, so two
+    nets can claim the same cell. Slice 4 now RESOLVES that: the lower-HPWL net
+    keeps the contested cell, the loser is ripped up and reroutes around it.
+    Both end routed with zero shared cells (was: an unresolved conflict)."""
     chip = torch.full((1, 5, 5), 1.0)
     guide = _full_guide(5, 5)
-    net_a = [(0, 2, 0), (0, 2, 2)]   # claims row-2 cols 0-2
-    net_b = [(0, 0, 1), (0, 4, 1)]   # straight col-1 path crosses row 2 at (0,2,1)
+    net_a = [(0, 2, 0), (0, 2, 2)]   # HPWL 2 (winner): row-2 cols 0-2
+    net_b = [(0, 0, 1), (0, 4, 1)]   # HPWL 4 (loser): col-1 crosses row 2 at (0,2,1)
     router = GuideRouter(
         chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
     )
     res_a, res_b = router.route([net_a, net_b], [guide, guide])
-    # Both route against the same snapshot — neither is blocked by the other.
+    # Both route, and the conflict is resolved — no shared cells remain.
     assert res_a.routed and res_b.routed
-    # They share cell (0, 2, 1): a same-round conflict, left for Slice 4.
-    assert not res_a.cells.isdisjoint(res_b.cells)
+    assert res_a.cells.isdisjoint(res_b.cells)
+    # The lower-HPWL net (a) keeps the contested cell (0, 2, 1).
+    assert (0, 2, 1) in res_a.cells
+    assert (0, 2, 1) not in res_b.cells
 
 
-def test_same_round_overlap_both_route_no_starvation():
-    """On a 1-row corridor two overlapping nets both route in the same round
-    (same snapshot): the longer net is NOT starved by the shorter one, because
-    within a round there is no commit-then-detour. Slice 2's HPWL contention
-    starvation is deferred to Slice 4 conflict resolution."""
-    chip = torch.full((1, 1, 5), 1.0)
-    guide = _full_guide(1, 5)
-    long_net = [(0, 0, 0), (0, 0, 4)]   # crosses cols 1-3
-    short_net = [(0, 0, 1), (0, 0, 2)]  # claims cols 1-2
+def test_same_round_overlap_resolved_loser_reroutes():
+    """Two overlapping same-round nets with room to detour both route after
+    rip-up: the lower-HPWL (shorter) net keeps the contested corridor cells,
+    the longer loser reroutes around them. Zero shared cells; both routed.
+    (Was: Slice 3 left the overlap unresolved for Slice 4.)"""
+    chip = torch.full((1, 3, 5), 1.0)  # 3 rows give the loser room to detour
+    guide = _full_guide(3, 5)
+    long_net = [(0, 0, 0), (0, 0, 4)]   # HPWL 4 (loser): spans cols 0-4 on row 0
+    short_net = [(0, 0, 1), (0, 0, 2)]  # HPWL 1 (winner): claims row-0 cols 1-2
     router = GuideRouter(
         chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
     )
     res_long, res_short = router.route(
         [long_net, short_net], [guide, guide],  # input order: long first
     )
-    # Same snapshot → both route; the long net is no longer starved.
+    # Both route; the conflict is resolved (no shared cells).
     assert res_short.routed and res_long.routed
-    # Overlap on cols 1-2 — a conflict Slice 4 will resolve.
-    assert not res_long.cells.isdisjoint(res_short.cells)
+    assert res_long.cells.isdisjoint(res_short.cells)
     # Results are returned in input order regardless of routing order.
     assert res_long.pins == long_net and res_short.pins == short_net
 
@@ -456,3 +456,79 @@ def test_netplan_carries_index_pins_region():
     assert plan.index == 0
     assert plan.pins == pins
     assert plan.region.cell_count > 0
+
+
+# --- Slice 4: cross-net conflict detect + rip-up / reroute -------------------
+
+
+def test_ripup_lower_hpwl_wins_loser_reroutes():
+    """Two nets conflict on a shared cell; the lower-HPWL net keeps it and the
+    loser reroutes around. Both end routed with zero shared cells (the core
+    Slice 4 conflict-resolution guarantee, ADR 0007 + ADR 0008)."""
+    chip = torch.full((1, 5, 5), 1.0)
+    guide = _full_guide(5, 5)
+    winner = [(0, 2, 0), (0, 2, 2)]   # HPWL 2: row-2 corridor
+    loser = [(0, 0, 2), (0, 4, 2)]    # HPWL 4: col-2 crosses (0, 2, 2)
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    res_w, res_l = router.route([winner, loser], [guide, guide])
+    assert res_w.routed and res_l.routed
+    assert res_w.cells.isdisjoint(res_l.cells)  # conflict resolved
+    # The winner keeps the contested cell; the loser detoured off it.
+    assert (0, 2, 2) in res_w.cells
+    assert (0, 2, 2) not in res_l.cells
+
+
+def test_ripup_unroutable_loser_fails_winner_survives():
+    """When a ripped-up loser cannot reroute (no room to detour after the
+    winner commits), it ends routed=False (paths None) while the winner stays
+    routed=True — bounded rip-up gives up cleanly, no crash."""
+    # 1-row corridor: once the winner takes cols 1-2 there is no detour.
+    chip = torch.full((1, 1, 5), 1.0)
+    guide = _full_guide(1, 5)
+    winner = [(0, 0, 1), (0, 0, 2)]   # HPWL 1: claims cols 1-2
+    loser = [(0, 0, 0), (0, 0, 4)]    # HPWL 4: must cross cols 1-2, no detour
+    router = GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    res_w, res_l = router.route([winner, loser], [guide, guide])
+    assert res_w.routed                 # winner keeps its route
+    assert not res_l.routed             # loser gives up after the rip-up cap
+    assert res_l.paths is None          # unrouted sentinel preserved
+    assert res_l.pins == loser          # result still carries the loser's pins
+
+
+def test_no_conflict_fires_no_extra_reroute_batch(monkeypatch):
+    """When no nets conflict, no rip-up reroute happens: the sweep is invoked
+    only for the initial routing rounds, never an extra reroute pass. Asserted
+    via a call counter wrapped around the batched sweep helper."""
+    import gpu_pnr.guide_router as gr
+
+    chip = torch.full((1, 12, 12), 1.0)
+    # Spatially disjoint nets — guaranteed zero cross-net conflicts.
+    net_a = [(0, 0, 0), (0, 1, 2)]
+    net_b = [(0, 8, 8), (0, 10, 10)]
+    nets = [net_a, net_b]
+    guides = [
+        [_rect(0, 0, 3000, 3000, "M1")],
+        [_rect(8000, 8000, 12000, 12000, "M1")],
+    ]
+
+    real_attach = gr.GuideRouter._attach_batch
+    calls = {"n": 0}
+
+    def counting_attach(self, *args, **kwargs):
+        calls["n"] += 1
+        return real_attach(self, *args, **kwargs)
+
+    monkeypatch.setattr(gr.GuideRouter, "_attach_batch", counting_attach)
+
+    router = gr.GuideRouter(
+        chip, chip_origin=ORIGIN, layer_order=LAYERS, pitch_dbu=PITCH, margin=4,
+    )
+    results = router.route(nets, guides)
+    assert all(r.routed for r in results)
+    # Both 2-pin disjoint nets finish in a single attachment round → exactly
+    # one batched sweep. A rip-up reroute would add at least one more.
+    assert calls["n"] == 1
