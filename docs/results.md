@@ -1004,6 +1004,38 @@ dominates the kernel saving at full scale, that is the signal to push backtrace
 onto the GPU. Not isolated yet (the 1.34× is net of both effects); profile in
 Slice 6.
 
+# Phase 3.3 — GuideRouter Slice 4: cross-net conflict rip-up / reroute
+
+Slice 4 makes the same-snapshot conflicts Slice 3 deferred actually resolve.
+After the population drains, cells claimed by ≥2 committed nets are detected;
+the lowest-HPWL net keeps each contested cell (ADR 0007), losers are ripped up
+(loser-exclusive cells restored from the original `w_chip`) and rerouted
+against the updated `w_cur`, bounded to `MAX_RIPUPS=3`.
+
+Hazard3 sample-1000, MPS, bucket 16 (`scripts/guide_router_hazard3.py
+--device mps --sample 1000 --bucket 16`):
+
+| metric | Slice 3 (deferred) | Slice 4 (resolved) |
+|---|---:|---:|
+| cross-net conflicts | ~1587 | **0** |
+| in-cap routed | (counted-with-overlap) | 721/935 = **77.1%** |
+| ms/net (in-cap aggregate) | — | 18.3 |
+
+- **0 cross-net conflicts** — the Slice 4 exit criterion. The committed set is
+  now physically legal (no cell claimed by two nets).
+- **Routability drops to 77.1% as the count goes honest.** Under Slice 3 a
+  conflicting net was reported "routed" while overlapping a neighbour; Slice 4
+  forces each conflict to a real outcome — the loser reroutes (stays routed) or
+  exhausts its 3-round budget (becomes unrouted). So routed-fraction *must* fall
+  as overlaps are eliminated; 77.1% legal beats a higher number with 1587
+  illegal overlaps.
+- **Walk-back signal (ADR 0012 Slice 4):** 22.9% unrouted is well past the >1%
+  threshold for raising `MAX_RIPUPS` to 5. But the current run doesn't separate
+  *rip-up non-convergence* from *initial cross-net contention* (a net can fail
+  to route at all before any conflict). Instrument that split before tuning the
+  cap; the unroutable tail is also Slice 5's (coarsened pass) target. Recorded
+  as the Slice 4 carried follow-up in the plan.
+
 ## vs OpenROAD drt (TritonRoute) — rough, orientation only
 
 The WS3.3 Slice 6 quality gate is ≤1.2× wire, ≤1.2× vias vs OpenROAD's detailed

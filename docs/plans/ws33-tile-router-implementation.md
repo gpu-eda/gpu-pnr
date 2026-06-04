@@ -1,12 +1,14 @@
 # Plan — WS3.3 guide-constrained router implementation
 
-**Status: ACTIVE (2026-06-03).** Slices 1–3 + **size-bucketing** landed. The
+**Status: ACTIVE (2026-06-04).** Slices 1–4 + **size-bucketing** landed. The
 brief 2026-06-02 pause ([ADR 0013](../adr/0013-pause-e5-detailed-routing-on-mps.md))
 was reversed (Am1): Slice 3's collapse was padding-to-max waste, and
 size-bucketing makes the router **22–33× faster, routes bit-identical**
 ([`../spikes/size-bucketed-batching.md`](../spikes/size-bucketed-batching.md)) —
 closing a ~100× gap to ~3.8× slower than drt's comparable pass (not ahead).
-**Slice 4 (rip-up) is next.**
+Slice 4 (rip-up) lands **0 cross-net conflicts** on Hazard3 sample-1000 (was
+~1587 deferred); routability 77.1% trips the walk-back trigger (see Slice 4
+carried follow-up). **Slice 5 (coarsened-pass tail) is next.**
 
 Supersedes the 8-slice fixed-tile + K=100 + halo plan (in `git log` before
 2026-06-01), which [ADR 0012](../adr/0012-tile-decomposition.md) Amendments
@@ -217,25 +219,46 @@ GPU or revisit the batch grouping — record as an ADR 0012 amendment.
 
 ---
 
-### Slice 4 — Cross-net conflict detect + rip-up / reroute
+### Slice 4 — Cross-net conflict detect + rip-up / reroute ✅ DONE
 
-**Deliverable:** after a batch commits, detect cells claimed by ≥2 nets; keep
-the lowest-HPWL net (ADR 0007), requeue the losers; reroute them against the
-updated `w_cur` in a subsequent batch. Bounded rounds (≤3, then mark
-`routed=False`). This is the [ADR 0008](../adr/0008-defer-route-nets-batched.md)
+**Landed** in `GuideRouter.route` (rip-up loop) + `_route_population`,
+`_seed_work`, `_ripup_net`, `_collect_losers`, `_cell_index_tensors`
+(`src/gpu_pnr/guide_router.py`; suite 113 → 116). After the population drains,
+cells claimed by ≥2 committed nets are detected; the lowest-HPWL net keeps each
+contested cell (ADR 0007), losers are ripped up + requeued, rerouted against
+the updated `w_cur`. Bounded to `MAX_RIPUPS=3`; a net still conflicting after
+the cap is left unrouted. The [ADR 0008](../adr/0008-defer-route-nets-batched.md)
 unlock, on guide sub-grids.
 
-**Tests:**
-- two nets conflict → lower-HPWL wins, loser reroutes around.
-- unroutable-after-ripup → loser `routed=False`, winner `True`, no crash.
-- no conflicts → no extra reroute batch (assert via a sweep-call counter).
+- **The watch-out (handled):** rip-up restores each loser's *loser-exclusive*
+  cells from the original `w_chip`/`w_v_chip` (full restore, **not**
+  clear-to-finite — keeps PDK pin-access values) and clears the `committed`
+  bits. Cells shared with a surviving winner stay committed to the winner.
+- `route` was refactored so the round-batched attach+commit loop is a pure
+  `_route_population` primitive ("drain to completion against the current
+  `w_cur`"); `route` wraps it in the rip-up loop. Population keyed by one
+  `net_to_work` dict (HPWL-ascending insertion order preserved across requeue).
 
-**Exit:** tests pass; Hazard3 final committed set has **0 cross-net
-conflicts**.
+**Tests landed:** two existing same-round tests updated to assert 0 cross-net
+conflicts (were: left for Slice 4); three new — lower-HPWL wins + loser
+reroutes, unroutable loser fails cleanly while winner survives, no-conflict
+fires no extra reroute batch (sweep-call counter).
+
+**Exit criterion met:** Hazard3 sample-1000 (MPS, bucket 16) → **0 cross-net
+conflicts** (was ~1587 deferred under Slice 3). 18.3 ms/net.
+
+**Carried follow-up (walk-back signal):** at sample-1000, in-cap routability is
+**77.1%** (214/935 unrouted) — conflicts are now *resolved* (loser reroutes or
+fails) rather than counted-as-routed-with-overlap, so routed-fraction drops as
+the count goes honest. But 22.9% unrouted trips the Slice 4 walk-back trigger
+(">1% fail to converge"). **Next: instrument rip-up vs initial-contention
+failures, then decide whether to raise `MAX_RIPUPS` to 5** (one-line change +
+re-measure) or leave the tail to Slice 5's coarsened pass. The current run
+doesn't separate the two failure modes; that's the first thing to measure.
 
 **Risk/walk-back:** if ripup doesn't converge within 3 rounds for >1% of
 nets, raise the cap to 5; else leave them failed (caller falls back to the
-existing per-net mini-grid).
+existing per-net mini-grid). **The >1% threshold is tripped — investigate.**
 
 ---
 
